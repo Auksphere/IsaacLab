@@ -1,35 +1,64 @@
 # Everything past this stage is to install
 # ROS2 Humble
-FROM isaac-lab-base AS ros2
+# FROM isaac-lab-base AS ros2
 
-# Which ROS2 apt package to install
-ARG ROS2_APT_PACKAGE
+# # Which ROS2 apt package to install
+# ARG ROS2_APT_PACKAGE
 
-# ROS2 Humble Apt installations
-RUN --mount=type=cache,target=/var/cache/apt \
-    apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    # Install ROS2 Humble \
-    software-properties-common && \
-    add-apt-repository universe && \
-    curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key -o /usr/share/keyrings/ros-archive-keyring.gpg && \
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu $(. /etc/os-release && echo jammy) main" | tee /etc/apt/sources.list.d/ros2.list > /dev/null && \
-    apt-get update && apt-get install -y --no-install-recommends \
-    ros-humble-${ROS2_APT_PACKAGE} \
-    ros-humble-vision-msgs \
-    # Install both FastRTPS and CycloneDDS
-    ros-humble-rmw-cyclonedds-cpp \
-    ros-humble-rmw-fastrtps-cpp \
-    # This includes various dev tools including colcon
-    ros-dev-tools && \
-    # Install rosdeps for extensions that declare a ros_ws in
-    # their extension.toml
-    ${ISAACLAB_PATH}/isaaclab.sh -p ${ISAACLAB_PATH}/tools/install_deps.py rosdep ${ISAACLAB_PATH}/source && \
-    apt -y autoremove && apt clean autoclean && \
-    rm -rf /var/lib/apt/lists/* && \
-    # Add sourcing of setup.bash to .bashrc
-    echo "source /opt/ros/humble/setup.bash" >> ${HOME}/.bashrc
+# # ROS2 Humble Apt installations
+# RUN --mount=type=cache,target=/var/cache/apt \
+#     apt-get update && apt-get install -y --no-install-recommends \
+#     curl \
+#     # Install ROS2 Humble \
+#     software-properties-common && \
+#     add-apt-repository universe && \
+#     curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key -o /usr/share/keyrings/ros-archive-keyring.gpg && \
+#     echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu $(. /etc/os-release && echo jammy) main" | tee /etc/apt/sources.list.d/ros2.list > /dev/null && \
+#     apt-get update && apt-get install -y --no-install-recommends \
+#     ros-humble-${ROS2_APT_PACKAGE} \
+#     ros-humble-vision-msgs \
+#     # Install both FastRTPS and CycloneDDS
+#     ros-humble-rmw-cyclonedds-cpp \
+#     ros-humble-rmw-fastrtps-cpp \
+#     # This includes various dev tools including colcon
+#     ros-dev-tools && \
+#     # Install rosdeps for extensions that declare a ros_ws in
+#     # their extension.toml
+#     ${ISAACLAB_PATH}/isaaclab.sh -p ${ISAACLAB_PATH}/tools/install_deps.py rosdep ${ISAACLAB_PATH}/source && \
+#     apt -y autoremove && apt clean autoclean && \
+#     rm -rf /var/lib/apt/lists/* && \
+#     # Add sourcing of setup.bash to .bashrc
+#     echo "source /opt/ros/humble/setup.bash" >> ${HOME}/.bashrc
 
-# Copy the RMW specifications for ROS2
-# https://docs.isaacsim.omniverse.nvidia.com/latest/installation/install_ros.html
-COPY docker/.ros/ ${DOCKER_USER_HOME}/.ros/
+#     #TODO: 整理一下
+# #     cd IsaacSim-ros_workspaces/
+# #    30  ls
+# #    31  cd humble_ws/
+# #    32  ls
+# #    33  colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
+# #    34  sudo apt-get install --reinstall ca-certificates
+# #    35  sudo update-ca-certificates
+# #    36  ls
+# #    37  ls build/
+# #    38  cd build/libfranka/
+# #    39  ls
+# #    40  mkdir -p googletest-prefix/src/
+# #    41  cd googletest-prefix/src/
+# #    42  wget https://github.com/google/googletest/archive/refs/tags/release-1.8.0.tar.gz
+# #    43  cd ../../../
+# #    44  cd ..
+# #    45  colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
+# #    46  colcon build --symlink-install --parallel-workers 4 --cmake-args -DCMAKE_BUILD_TYPE=Release -DCMAKE_BUILD_PARALLEL_LEVEL=8
+# #    47  colcon build --symlink-install --parallel-workers 4 --cmake-args -DCMAKE_BUILD_TYPE=Release
+# # apt install ros-humble-ros2-control
+# # sudo apt install ros-humble-ament-lint
+# # sudo apt-get install ros-humble-moveit-core ros-humble-moveit-ros-planning
+# # sudo apt-get install ros-humble-pinocchio ros-humble-hpp-fcl
+# # sudo apt-get install ros-humble-xacro
+# # sudo apt-get install ros-humble-ros2-control ros-humble-ros2-controllers
+
+# # Copy the RMW specifications for ROS2
+# # https://docs.isaacsim.omniverse.nvidia.com/latest/installation/install_ros.html
+# COPY docker/.ros/ ${DOCKER_USER_HOME}/.ros/
+
+FROM ghcr.io/linkage-x/isaac-lab-ros2:v0 as ros2

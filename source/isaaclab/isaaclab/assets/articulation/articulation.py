@@ -7,6 +7,8 @@
 # pyright: reportPrivateUsage=false
 
 from __future__ import annotations
+import sys
+sys.path.append('/isaac-sim/exts/isaacsim.core.utils')
 
 import torch
 from collections.abc import Sequence

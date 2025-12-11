@@ -38,6 +38,9 @@ x-default-isaac-lab-volumes: &default-isaac-lab-volumes
     source: ../source
     target: ${DOCKER_ISAACLAB_PATH}/source
   - type: bind
+    source: ../../HIROLRobotPlatform
+    target: ${DOCKER_ISAACLAB_PATH}/HIROLRobotPlatform
+  - type: bind
     source: ../docs
     target: ${DOCKER_ISAACLAB_PATH}/docs
   - type: bind
@@ -61,6 +64,9 @@ x-default-isaac-lab-volumes: &default-isaac-lab-volumes
 x-default-isaac-lab-environment: &default-isaac-lab-environment
   - ISAACSIM_PATH=${DOCKER_ISAACLAB_PATH}/_isaac_sim
   - OMNI_KIT_ALLOW_ROOT=1
+  - http_proxy=http://127.0.0.1:7897
+  - https_proxy=http://127.0.0.1:7897
+  - no_proxy=localhost,127.0.0.1
 
 x-default-isaac-lab-deploy: &default-isaac-lab-deploy
   resources:
@@ -68,7 +74,7 @@ x-default-isaac-lab-deploy: &default-isaac-lab-deploy
       devices:
         - driver: nvidia
           count: all
-          capabilities: [ gpu ]
+          capabilities: [ gpu, graphics, display, utility, video, compute ]
 
 services:
   # This service is the base Isaac Lab image
