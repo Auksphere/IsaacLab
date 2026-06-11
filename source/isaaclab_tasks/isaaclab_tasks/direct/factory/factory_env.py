@@ -12,31 +12,154 @@ import isaacsim.core.utils.torch as torch_utils
 import isaaclab.sim as sim_utils
 from isaaclab.assets import Articulation
 from isaaclab.envs import DirectRLEnv
+from isaaclab.sensors import TiledCamera
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
-from isaaclab.utils.math import axis_angle_from_quat
+from isaaclab.utils.math import axis_angle_from_quat, quat_apply
 
 from . import factory_control as fc
-from .factory_env_cfg import OBS_DIM_CFG, STATE_DIM_CFG, FactoryEnvCfg
+from .factory_env_cfg import (
+    CONTACT_DIM_CFG,
+    FORCE_DIM_CFG,
+    FT_FILTER_CFG,
+    OBS_DIM_CFG,
+    STATE_DIM_CFG,
+    FactoryEnvCfg,
+)
 
 
 class FactoryEnv(DirectRLEnv):
     cfg: FactoryEnvCfg
 
     def __init__(self, cfg: FactoryEnvCfg, render_mode: str | None = None, **kwargs):
-        # Update number of obs/states
-        cfg.observation_space = sum([OBS_DIM_CFG[obs] for obs in cfg.obs_order])
-        cfg.state_space = sum([STATE_DIM_CFG[state] for state in cfg.state_order])
+        # Merge DIM_CFGs so that both base and vision configs resolve correctly.
+        obs_dim_cfg = {**OBS_DIM_CFG, **FORCE_DIM_CFG, **CONTACT_DIM_CFG}
+        state_dim_cfg = {**STATE_DIM_CFG, **FORCE_DIM_CFG, **CONTACT_DIM_CFG}
+
+        cfg.observation_space = sum([obs_dim_cfg[obs] for obs in cfg.obs_order])
+        cfg.state_space = sum([state_dim_cfg[state] for state in cfg.state_order])
         cfg.observation_space += cfg.action_space
         cfg.state_space += cfg.action_space
+
+        # Stage F encoder mode: override policy/critic obs dims
+        encoder_ckpt = getattr(cfg, "encoder_checkpoint", "")
+        self._encoder_debug_state_policy = getattr(cfg, "encoder_debug_state_policy", False)
+        if encoder_ckpt:
+            if self._encoder_debug_state_policy:
+                # Debug mode: actor sees same privileged state as critic
+                # (bypasses encoder — sanity check that env/RL pipeline has no bugs)
+                cfg.observation_space = cfg.state_space
+                # Disable cameras — not needed in debug mode, saves ~4x GPU time
+                cfg.tiled_camera_left = None
+                cfg.tiled_camera_right = None
+            else:
+                # policy = [Δv(vis_dim), Δf(64), proprio(20), prev_action(6)]
+                # vis_dim depends on backbone — hardcoded for now
+                backbone_name = getattr(cfg, "encoder_backbone", "resnet18")
+                if backbone_name == "dinov2_vits14":
+                    vis_dim = 384
+                elif backbone_name == "dinov2_vitb14":
+                    vis_dim = 768
+                elif backbone_name == "resnet50":
+                    vis_dim = 2048
+                else:
+                    vis_dim = 512  # resnet18
+                cfg.observation_space = vis_dim + 64 + 20 + 6
+            # critic uses privileged state (same as baseline's 55D) — no override needed
         self.cfg_task = cfg.task
 
+        # --- Sensor attributes (must be set BEFORE super().__init__ because
+        # DirectRLEnv.__init__ calls _setup_scene which references them) ---
+        self._tiled_camera_left: TiledCamera | None = None
+        self._tiled_camera_right: TiledCamera | None = None
+        self.hand_body_idx: int | None = None
+
         super().__init__(cfg, render_mode, **kwargs)
+
+        # Apply render quality settings BEFORE first physics step so the
+        # renderer picks them up. RasterizedLighting + no RTX gives ~5-10x
+        # faster camera renders with negligible quality loss at 224×224.
+        self._apply_render_quality()
 
         self._set_body_inertias()
         self._init_tensors()
         self._set_default_dynamics_parameters()
+
+        # --- Hand body index + FT buffers (must be before _compute_intermediate_values) ---
+        self.hand_body_idx = self._robot.body_names.index("panda_hand")
+
+        self.ft_history_len = FT_FILTER_CFG["history_len"]
+        self.ft_history = torch.zeros((self.num_envs, self.ft_history_len, 6), device=self.device)
+        self.ft_history_ptr = 0
+        self.force_torque = torch.zeros((self.num_envs, 6), device=self.device)
+        self.delta_f = torch.zeros((self.num_envs, 6), device=self.device)
+        self.contact_force_state = torch.zeros((self.num_envs, 4), device=self.device)
+        self.engagement_state = torch.zeros((self.num_envs, 1), device=self.device)
+
+        # 3-frame force ring buffer: [F(t-2), F(t-1), F(t)] → (N, 3, 6)
+        self.ft_ring = torch.zeros((self.num_envs, 3, 6), device=self.device)
+
         self._compute_intermediate_values(dt=self.physics_dt)
+
+        # Load pretrained encoder if checkpoint path is configured.
+        # Skip in debug mode — the encoder is never called (policy = critic = state).
+        from .encoder import VisualForceEncoder
+        encoder_ckpt = getattr(cfg, "encoder_checkpoint", None)
+        self._encoder: VisualForceEncoder | None = None
+        if encoder_ckpt is not None and encoder_ckpt != "" and not self._encoder_debug_state_policy:
+            backbone_name = getattr(cfg, "encoder_backbone", "resnet18")
+            self._encoder = VisualForceEncoder.from_checkpoint(
+                str(encoder_ckpt), backbone_name=backbone_name, device=self.device)
+            print(f"[INFO] Loaded frozen encoder from {encoder_ckpt} "
+                  f"(feature_dim={self._encoder.feature_dim})")
+
+            # Ring buffer for Δ feature computation
+            self.K = 3  # matches pretrain frame-skip
+            fd = self._encoder.feature_dim  # vis_dim + 64
+            self._feat_ring = torch.zeros((self.num_envs, self.K + 1, fd),
+                                          device=self.device)
+            self._feat_ring_ptr = 0
+
+    def _apply_render_quality(self):
+        """Apply carb render-quality settings from the env config.
+
+        Called once during ``__init__``, before the first render step.
+        ``RasterizedLighting`` + all RTX off → ~5-10x faster camera renders
+        at the cost of ray-traced shadows/GI (negligible at 224×224 for RL).
+        """
+        try:
+            import carb
+            s = carb.settings.get_settings()
+        except Exception:
+            return
+
+        render_mode = getattr(self.cfg, "render_mode", "")
+        if render_mode:
+            try:
+                s.set("/rtx/rendermode", str(render_mode))
+            except Exception:
+                pass
+
+        bool_flags = [
+            ("rtx_ao", "/rtx/ambientOcclusion/enabled"),
+            ("rtx_shadows", "/rtx/shadows/enabled"),
+            ("rtx_reflections", "/rtx/reflections/enabled"),
+            ("rtx_gi", "/rtx/indirectDiffuse/enabled"),
+        ]
+        for cfg_key, carb_path in bool_flags:
+            val = getattr(self.cfg, cfg_key, None)
+            if val is not None:
+                try:
+                    s.set(carb_path, bool(val))
+                except Exception:
+                    pass
+
+        spp = getattr(self.cfg, "rtx_spp", None)
+        if spp is not None:
+            try:
+                s.set("/rtx/pathtracing/spp", int(spp))
+            except Exception:
+                pass
 
     def _set_body_inertias(self):
         """Note: this is to account for the asset_options.armature parameter in IGE."""
@@ -172,6 +295,12 @@ class FactoryEnv(DirectRLEnv):
             self._small_gear_asset = Articulation(self.cfg_task.small_gear_cfg)
             self._large_gear_asset = Articulation(self.cfg_task.large_gear_cfg)
 
+        # --- Create cameras BEFORE clone (so prims exist in template env_0) ---
+        if self.cfg.tiled_camera_left is not None:
+            self._tiled_camera_left = TiledCamera(self.cfg.tiled_camera_left)
+        if self.cfg.tiled_camera_right is not None:
+            self._tiled_camera_right = TiledCamera(self.cfg.tiled_camera_right)
+
         self.scene.clone_environments(copy_from_source=False)
 
         self.scene.articulations["robot"] = self._robot
@@ -180,6 +309,12 @@ class FactoryEnv(DirectRLEnv):
         if self.cfg_task.name == "gear_mesh":
             self.scene.articulations["small_gear"] = self._small_gear_asset
             self.scene.articulations["large_gear"] = self._large_gear_asset
+
+        # --- Register cameras with scene after clone ---
+        if self._tiled_camera_left is not None:
+            self.scene.sensors["tiled_camera_left"] = self._tiled_camera_left
+        if self._tiled_camera_right is not None:
+            self.scene.sensors["tiled_camera_right"] = self._tiled_camera_right
 
         # add lights
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
@@ -248,10 +383,142 @@ class FactoryEnv(DirectRLEnv):
         self.keypoint_dist = torch.norm(self.keypoints_held - self.keypoints_fixed, p=2, dim=-1).mean(-1)
         self.last_update_timestamp = self._robot._data._sim_timestamp
 
-    def _get_observations(self):
-        """Get actor/critic inputs using asymmetric critic."""
-        noisy_fixed_pos = self.fixed_pos_obs_frame + self.init_fixed_pos_obs_noise
+        # Update FT (camera poses updated once per step in _pre_physics_step
+        self._update_force_torque()
 
+    def _update_force_torque(self):
+        """Read net contact force on the peg via fingertip force summation.
+
+        Minimal pipeline (per paper consensus — MCR/AFRO/MSDP):
+          raw fingertip forces → sum left+right → normalize(/50.0)
+
+        k=3 differencing in the pretraining architecture (idea.md §3) naturally
+        cancels the DC offset from gravity + gripper holding force.  No EMA,
+        baseline subtraction, deadzone, or clipping — the network learns its
+        own representations from the full dynamic range.
+        """
+        if not hasattr(self, "left_finger_body_idx"):
+            return
+
+        raw_wrench = self._robot.root_physx_view.get_link_incoming_joint_force()
+        left_f  = raw_wrench[:, self.left_finger_body_idx, :]
+        right_f = raw_wrench[:, self.right_finger_body_idx, :]
+        raw_ft  = left_f + right_f  # (N, 6)
+
+        # No hand-coded normalisation — ForceMLP's LayerNorm learns the
+        # optimal scaling from data (sim + real).
+        self.force_torque[:, :] = raw_ft
+
+        # 3-frame ring buffer for encoder input: [F(t-2), F(t-1), F(t)]
+        self.ft_ring[:, 0:2, :] = self.ft_ring[:, 1:3, :].clone()
+        self.ft_ring[:, 2, :] = raw_ft
+
+        # 5-frame ring buffer (for delta_f computation)
+        self.ft_history[:, self.ft_history_ptr, :] = self.force_torque
+        self.ft_history_ptr = (self.ft_history_ptr + 1) % self.ft_history_len
+
+        prev_ptr = (self.ft_history_ptr - 3) % self.ft_history_len
+        self.delta_f[:, :] = self.force_torque - self.ft_history[:, prev_ptr, :]
+
+        # --- 4-class contact-force state (aligned with idea.md §B) ---
+        # Defined purely by structural force features — cross-domain stable:
+        #   FREE (1,0,0,0):         |F|_max < τ  → no contact
+        #   CONTACT_UP (0,1,0,0):   |F|_max ≥ τ AND max(ΔF) > ε  → force rising
+        #   CONTACT_DOWN (0,0,1,0): |F|_max ≥ τ AND min(ΔF) < −ε → force dropping
+        #   CONTACT_STEADY (0,0,0,1):|F|_max ≥ τ AND |ΔF|_max ≤ ε → contact, stable
+        # τ (noise floor): deadzone_n / clip_n in normalized space
+        # ε (force delta threshold): 0.02 normalized (≈ 1.0N raw)
+        # ΔF = F_t - F_{t-3}  (k=3 step force difference, aligned with idea.md)
+        tau = FT_FILTER_CFG["deadzone_n"] / FT_FILTER_CFG["clip_n"]  # ≈ 0.02
+        eps = 0.02  # force delta threshold in normalized space (~1.0N raw)
+
+        f_mag = self.force_torque.abs().max(dim=-1).values  # (N,) max abs across 6 axes
+        df_mag = self.delta_f.abs().max(dim=-1).values               # (N,) max abs ΔF
+
+        is_free = f_mag < tau
+        df_rising = self.delta_f.max(dim=-1).values > eps
+        df_falling = self.delta_f.min(dim=-1).values < -eps
+        in_contact = ~is_free
+
+        self.contact_force_state[:, 0] = is_free.float()
+        self.contact_force_state[:, 1] = (in_contact & df_rising).float()
+        self.contact_force_state[:, 2] = (in_contact & df_falling).float()
+        self.contact_force_state[:, 3] = (in_contact & ~df_rising & ~df_falling).float()
+
+        # Engagement state: inherited from prior keypoint-based definition.
+        engage_dist = self.cfg_task.engage_threshold * self.cfg_task.fixed_asset_cfg.height
+        self.engagement_state[:, 0] = (self.keypoint_dist <= engage_dist).float()
+
+    def _update_camera_poses(self):
+        """Update camera world poses to track the panda_hand body.
+
+        Uses ``set_world_poses_from_view`` to avoid MuJoCo→IsaacLab quaternion
+        convention issues. Both cameras look at the peg tip area below the hand.
+
+        Body-local offsets (mujoco panda.xml hand body frame, X-fwd Y-left Z-up):
+          cam1 (left):  eye=(-0.10, 0, 0.07) — behind hand center, above
+          cam2 (right): eye=( 0.10, 0, 0.07)
+          target:       ( 0.05, 0, -0.12) — peg tip, forward and below hand center
+        """
+        if self._tiled_camera_left is None:
+            return
+
+        hand_pos = self._robot.data.body_pos_w[:, self.hand_body_idx]  # (N, 3)
+        hand_quat = self._robot.data.body_quat_w[:, self.hand_body_idx]  # (N, 4) wxyz
+
+        # 这样就可以不用折腾四元数了，只用规定相机的注视点
+        # Body-local offsets
+        # Use randomised offsets when domain rand is active, else defaults.
+        e1 = getattr(self, "_eye1_local", [-0.08, -0.0, 0.08])
+        e2 = getattr(self, "_eye2_local", [0.08, 0.0, 0.08])
+        tgt = getattr(self, "_target_local", [0.0, 0.0, 0.17])
+        eye1_local = torch.tensor(e1, device=self.device)
+        eye2_local = torch.tensor(e2, device=self.device)
+        target_local = torch.tensor(tgt, device=self.device)
+
+        # Transform to world frame
+        eye1_world = hand_pos + quat_apply(hand_quat, eye1_local.expand_as(hand_pos))
+        eye2_world = hand_pos + quat_apply(hand_quat, eye2_local.expand_as(hand_pos))
+        target_world = hand_pos + quat_apply(hand_quat, target_local.expand_as(hand_pos))
+
+        # set_world_poses_from_view auto-computes correct camera orientations
+        self._tiled_camera_left.set_world_poses_from_view(eye1_world, target_world)
+        self._tiled_camera_right.set_world_poses_from_view(eye2_world, target_world)
+
+    def _compute_encoder_features(self):
+        """Encode current frame → store in ring buffer → return Δ features.
+
+        Returns Δ concat (N, vis_dim + 64) = [v_t − v_{t−k}, f_t − f_{t−k}].
+        These Δ features received VICReg + dynamics gradients during pretrain.
+        """
+        if self._encoder is None or self._tiled_camera_left is None:
+            return None
+        from .encoder import preprocess_rgb
+        img_l = self._tiled_camera_left.data.output["rgb"]   # (N, H, W, 3) uint8
+        img_r = self._tiled_camera_right.data.output["rgb"]
+        img_l = preprocess_rgb(img_l)                         # (N, 3, 224, 224) float
+        img_r = preprocess_rgb(img_r)
+        ft_3f = self.ft_ring.view(self.num_envs, 18)          # (N, 18)
+
+        with torch.cuda.amp.autocast(enabled=True, dtype=torch.float16):
+            feat_t = self._encoder.forward_features(img_l, img_r, ft_3f)
+
+        # Store current features in ring buffer
+        self._feat_ring[:, self._feat_ring_ptr, :] = feat_t.float()
+        past_ptr = (self._feat_ring_ptr - self.K) % (self.K + 1)
+        feat_past = self._feat_ring[:, past_ptr, :]
+        self._feat_ring_ptr = (self._feat_ring_ptr + 1) % (self.K + 1)
+
+        # Δ = feat_t − feat_{t−k}
+        return feat_t - feat_past
+
+    def _get_observations(self):
+        """Get actor/critic inputs.
+
+        With encoder: policy = [Δv(vis_dim), Δf(64), proprio(20D), prev_action(6D)].
+        Without:      policy = 25D low-dim (proprio + force + prev_actions).
+        """
+        noisy_fixed_pos = self.fixed_pos_obs_frame + self.init_fixed_pos_obs_noise
         prev_actions = self.actions.clone()
 
         obs_dict = {
@@ -260,6 +527,8 @@ class FactoryEnv(DirectRLEnv):
             "fingertip_quat": self.fingertip_midpoint_quat,
             "ee_linvel": self.ee_linvel_fd,
             "ee_angvel": self.ee_angvel_fd,
+            "force_torque": self.force_torque,
+            "contact_force_state": self.contact_force_state,
             "prev_actions": prev_actions,
         }
 
@@ -275,20 +544,70 @@ class FactoryEnv(DirectRLEnv):
             "held_quat": self.held_quat,
             "fixed_pos": self.fixed_pos,
             "fixed_quat": self.fixed_quat,
-            "task_prop_gains": self.task_prop_gains,
-            "pos_threshold": self.pos_threshold,
-            "rot_threshold": self.rot_threshold,
+            "force_torque": self.force_torque,
+            "contact_force_state": self.contact_force_state,
+            "engagement_state": self.engagement_state,
+            "keypoint_dist": self.keypoint_dist.unsqueeze(-1),
             "prev_actions": prev_actions,
         }
-        obs_tensors = [obs_dict[obs_name] for obs_name in self.cfg.obs_order + ["prev_actions"]]
-        obs_tensors = torch.cat(obs_tensors, dim=-1)
-        state_tensors = [state_dict[state_name] for state_name in self.cfg.state_order + ["prev_actions"]]
-        state_tensors = torch.cat(state_tensors, dim=-1)
-        return {"policy": obs_tensors, "critic": state_tensors}
+
+        # ── Encoder-based observations (Stage F) ──
+        if self._encoder_debug_state_policy:
+            # Debug mode: actor sees same privileged state as critic.
+            critic_obs = torch.cat([state_dict[name] for name in self.cfg.state_order + ["prev_actions"]], dim=-1)
+            observations = {"policy": critic_obs, "critic": critic_obs}
+        else:
+            enc_feat = self._compute_encoder_features()  # (N, vis_dim+64) or None
+            if enc_feat is not None:
+                # Proprio 20D: matches pretraining Δp format
+                proprio_20 = torch.cat([
+                    self.joint_pos[:, 0:7],          # 7
+                    self.fingertip_midpoint_pos,      # 3
+                    self.fingertip_midpoint_quat,     # 4
+                    self.ee_linvel_fd,                # 3
+                    self.ee_angvel_fd,                # 3
+                ], dim=-1)
+                policy_obs = torch.cat([enc_feat, proprio_20, prev_actions], dim=-1)
+                # Critic uses clean privileged state (same as baseline's 55D critic).
+                # Bottleneck is actor-only — critic doesn't need visual features.
+                critic_obs = torch.cat([state_dict[name] for name in self.cfg.state_order + ["prev_actions"]], dim=-1)
+                observations = {"policy": policy_obs, "critic": critic_obs}
+            else:
+                # ── Low-dim observations (backward-compatible) ──
+                obs_tensors = [obs_dict[name] for name in self.cfg.obs_order + ["prev_actions"]]
+                obs_tensors = torch.cat(obs_tensors, dim=-1)
+                state_tensors = [state_dict[name] for name in self.cfg.state_order + ["prev_actions"]]
+                state_tensors = torch.cat(state_tensors, dim=-1)
+                observations = {"policy": obs_tensors, "critic": state_tensors}
+
+        if self._tiled_camera_left is not None:
+            observations["camera_left_rgb"] = self._tiled_camera_left.data.output["rgb"]
+        if self._tiled_camera_right is not None:
+            observations["camera_right_rgb"] = self._tiled_camera_right.data.output["rgb"]
+
+        return observations
+
+    def get_camera_data(self) -> dict | None:
+        """Return camera images for external consumers (Stage D/E encoder pretraining).
+
+        Returns:
+            Dict with keys ``"left_rgb"`` and ``"right_rgb"``, each a tensor of
+            shape ``(num_envs, height, width, 3)`` in [0, 255] uint8 range.
+            Returns ``None`` if cameras are not configured.
+        """
+        if self._tiled_camera_left is None or self._tiled_camera_right is None:
+            return None
+        return {
+            "left_rgb": self._tiled_camera_left.data.output["rgb"],
+            "right_rgb": self._tiled_camera_right.data.output["rgb"],
+        }
 
     def _reset_buffers(self, env_ids):
         """Reset buffers."""
         self.ep_succeeded[env_ids] = 0
+        # Clear ring buffer for resetting envs — Δ = feat_t for first K steps
+        if hasattr(self, '_feat_ring') and self._feat_ring.shape[0] > 1:
+            self._feat_ring[env_ids] = 0.0
 
     def _pre_physics_step(self, action):
         """Apply policy actions with smoothing."""
@@ -299,6 +618,12 @@ class FactoryEnv(DirectRLEnv):
         self.actions = (
             self.cfg.ctrl.ema_factor * action.clone().to(self.device) + (1 - self.cfg.ctrl.ema_factor) * self.actions
         )
+
+        # Update camera poses BEFORE physics rendering so cameras track the hand
+        # for the current step. (Also called in _compute_intermediate_values for
+        # the FT pipeline; the duplicate is cheap.)
+        if self._tiled_camera_left is not None:
+            self._update_camera_poses()
 
     def close_gripper_in_place(self):
         """Keep gripper in current position as gripper closes."""
@@ -419,6 +744,11 @@ class FactoryEnv(DirectRLEnv):
         self._robot.set_joint_position_target(self.ctrl_target_joint_pos)
         self._robot.set_joint_effort_target(self.joint_torque)
 
+        # Update camera poses each decimation step so rendering captures the current
+        # hand position. (Also called from _pre_physics_step for the first frame.)
+        if self._tiled_camera_left is not None:
+            self._update_camera_poses()
+
     def _get_dones(self):
         """Update intermediate values used for rewards and observations."""
         self._compute_intermediate_values(dt=self.physics_dt)
@@ -531,7 +861,18 @@ class FactoryEnv(DirectRLEnv):
         self._set_franka_to_default_pose(joints=self.cfg.ctrl.reset_joints, env_ids=env_ids)
         self.step_sim_no_action()
 
+        # Per-episode domain randomization (lighting, physics, visual)
+        self._apply_domain_randomization(env_ids)
+
         self.randomize_initial_state(env_ids)
+
+        # Reset FT state for reset envs.
+        self.ft_history[env_ids] = 0.0
+        self.ft_ring[env_ids] = 0.0
+        self.force_torque[env_ids] = 0.0
+        self.delta_f[env_ids] = 0.0
+        self.contact_force_state[env_ids] = 0.0
+        self.engagement_state[env_ids] = 0.0
 
     def _get_target_gear_base_offset(self):
         """Get offset of target gear from the gear base asset."""
@@ -651,6 +992,252 @@ class FactoryEnv(DirectRLEnv):
         self.sim.step(render=False)
         self.scene.update(dt=self.physics_dt)
         self._compute_intermediate_values(dt=self.physics_dt)
+
+    def _apply_domain_randomization(self, env_ids):
+        """Apply per-episode visual, lighting, and physics randomization.
+
+        Draws parameters from ``self.cfg.domain_rand`` ranges.  Called once per
+        reset so every episode sees a different randomised configuration.
+        """
+        dr = self.cfg.domain_rand
+        n = len(env_ids)
+
+        def _uniform(lo: float, hi: float) -> float:
+            return float(lo + (hi - lo) * torch.rand(1).item())
+
+        # ── Lighting randomization (carb settings — affects all envs) ──
+        try:
+            import carb
+            s = carb.settings.get_settings()
+        except Exception:
+            s = None
+
+        if s is not None:
+            if dr.dome_light_intensity[1] > dr.dome_light_intensity[0]:
+                s.set("/rtx/domeLight/intensity",
+                      _uniform(*dr.dome_light_intensity) * 120.0)
+            if dr.key_light_intensity[1] > dr.key_light_intensity[0]:
+                s.set("/rtx/distantLight/intensity",
+                      _uniform(*dr.key_light_intensity) * 450.0)
+
+        # ── Camera position noise (modify eye_local) ──
+        if self._tiled_camera_left is not None:
+            # Store original offsets
+            if not hasattr(self, "_eye1_local_orig"):
+                # Use the offsets that _update_camera_poses uses
+                self._eye1_local_orig = [-0.08, -0.0, 0.08]
+                self._eye2_local_orig = [0.08, 0.0, 0.08]
+                self._target_local_orig = [0.0, 0.0, 0.17]
+
+            cp = dr.camera_pos_noise
+            ct = dr.camera_target_noise
+            self._eye1_local = [
+                self._eye1_local_orig[0] + _uniform(-cp[0], cp[0]),
+                self._eye1_local_orig[1] + _uniform(-cp[1], cp[1]),
+                self._eye1_local_orig[2] + _uniform(-cp[2], cp[2]),
+            ]
+            self._eye2_local = [
+                self._eye2_local_orig[0] + _uniform(-cp[0], cp[0]),
+                self._eye2_local_orig[1] + _uniform(-cp[1], cp[1]),
+                self._eye2_local_orig[2] + _uniform(-cp[2], cp[2]),
+            ]
+            self._target_local = [
+                self._target_local_orig[0] + _uniform(-ct[0], ct[0]),
+                self._target_local_orig[1] + _uniform(-ct[1], ct[1]),
+                self._target_local_orig[2] + _uniform(-ct[2], ct[2]),
+            ]
+
+        # ── Physics: mass randomization ──
+        if dr.held_mass_scale[1] > dr.held_mass_scale[0]:
+            scale = _uniform(*dr.held_mass_scale)
+            try:
+                mass_api = self._held_asset.root_physx_view.get_masses()
+                if mass_api is not None:
+                    default_mass = self._held_asset.default_mass.clone() if hasattr(self._held_asset, 'default_mass') else mass_api[env_ids].clone()
+                    new_mass = default_mass * scale
+                    self._held_asset.root_physx_view.set_masses(new_mass, env_ids)
+            except Exception:
+                pass
+
+        # ── Physics: friction randomization ──
+        if dr.held_friction[1] > dr.held_friction[0]:
+            sf = _uniform(*dr.held_friction)
+            df = sf * 0.85
+            try:
+                mats = self._held_asset.root_physx_view.get_material_properties()
+                mats[env_ids, 0] = sf   # static
+                mats[env_ids, 1] = df   # dynamic
+                self._held_asset.root_physx_view.set_material_properties(mats, env_ids)
+            except Exception:
+                pass
+
+        # ── Physics: robot dynamics randomization ──
+        if dr.joint_damping_scale[1] > dr.joint_damping_scale[0]:
+            kd_scale = _uniform(*dr.joint_damping_scale)
+            kp_scale = _uniform(*dr.joint_stiffness_scale) if dr.joint_stiffness_scale[1] > dr.joint_stiffness_scale[0] else 1.0
+            try:
+                gains = self._robot.root_physx_view.get_dof_stiffnesses_and_dampings()
+                if gains is not None:
+                    kp, kd = gains
+                    kp_new = kp.clone()
+                    kd_new = kd.clone()
+                    for j in range(min(7, kd_new.shape[1])):
+                        kp_new[env_ids, j] *= kp_scale
+                        kd_new[env_ids, j] *= kd_scale
+                    self._robot.root_physx_view.set_dof_stiffnesses_and_dampings(kp_new, kd_new, env_ids)
+            except Exception:
+                pass
+
+        # ── Physics: peg/hole scale randomization ──
+        if dr.peg_scale[1] > dr.peg_scale[0]:
+            peg_s = _uniform(*dr.peg_scale)
+            try:
+                self._held_asset.root_physx_view.set_scales(
+                    torch.full((n, 3), peg_s, device=self.device), env_ids)
+            except Exception:
+                pass
+
+        # ── Visual: material randomization (USD shader properties) ──
+        self._randomize_materials(dr, env_ids)
+
+    def _randomize_materials(self, dr, env_ids):
+        """Randomize material appearance: color, roughness, metallic on USD prims.
+
+        Walks the stage under held/fixed asset and table prims, finds
+        UsdPreviewSurface shaders, and randomises their inputs.
+        """
+        def _rand(lo: float, hi: float) -> float:
+            return float(lo + (hi - lo) * torch.rand(1).item())
+
+        try:
+            import omni.usd
+            from pxr import UsdShade, Gf
+            stage = omni.usd.get_context().get_stage()
+            if stage is None:
+                return
+        except Exception:
+            return
+
+        def _hsv_shift(rgb_in: tuple, hue_delta: float, sat_mul: float, val_mul: float) -> tuple:
+            """Shift hue (0-360°), multiply saturation and value."""
+            import colorsys
+            r, g, b = [max(0, min(1, float(c))) for c in rgb_in]
+            h, s, v = colorsys.rgb_to_hsv(r, g, b)
+            h = (h * 360.0 + hue_delta) % 360.0 / 360.0
+            s = max(0, min(1, s * sat_mul))
+            v = max(0, min(1, v * val_mul))
+            r, g, b = colorsys.hsv_to_rgb(h, s, v)
+            return (r, g, b)
+
+        def _modify_shader(shader, *, color_delta=None, roughness=None, metallic=None,
+                           color_shift=None, hue_shift=0, sat_mul=1.0, val_mul=1.0):
+            """Modify common UsdPreviewSurface shader inputs."""
+            if shader is None:
+                return
+            # Diffuse color
+            if color_delta or hue_shift or sat_mul != 1.0 or val_mul != 1.0:
+                inp = shader.GetInput("diffuseColor")
+                if inp:
+                    try:
+                        val = inp.Get()
+                        if val is not None:
+                            rgb = tuple(float(val[i]) for i in range(3))
+                            if hue_shift or sat_mul != 1.0 or val_mul != 1.0:
+                                rgb = _hsv_shift(rgb, hue_shift, sat_mul, val_mul)
+                            if color_delta:
+                                rgb = tuple(max(0, min(1, rgb[i] + color_delta[i])) for i in range(3))
+                            inp.Set(Gf.Vec3f(*rgb))
+                    except Exception:
+                        pass
+            if roughness is not None:
+                inp = shader.GetInput("roughness")
+                if inp:
+                    try:
+                        inp.Set(float(roughness))
+                    except Exception:
+                        pass
+            if metallic is not None:
+                inp = shader.GetInput("metallic")
+                if inp:
+                    try:
+                        inp.Set(float(metallic))
+                    except Exception:
+                        pass
+
+        def _randomize_prim_materials(prim, **kwargs):
+            """Walk a prim and randomize all bound materials."""
+            if prim is None:
+                return
+            try:
+                from pxr import UsdShade
+                for p in [prim] + list(prim.GetAllChildren()):
+                    mat_binding = UsdShade.MaterialBindingAPI(p)
+                    try:
+                        mat, _ = mat_binding.ComputeBoundMaterial()
+                    except Exception:
+                        continue
+                    if mat is None:
+                        continue
+                    surface = mat.GetSurface() if hasattr(mat, 'GetSurface') else None
+                    _modify_shader(surface, **kwargs)
+                    # Also try volume / displacement for full coverage
+                    for api_name in ('GetVolume', 'GetDisplacement'):
+                        api = getattr(mat, api_name, None)
+                        if callable(api):
+                            try:
+                                s = api()
+                                _modify_shader(s, **kwargs)
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+
+        # ── Held asset (peg): random hue / saturation / brightness ──
+        if dr.peg_hue_shift[1] > dr.peg_hue_shift[0] or dr.peg_saturation[1] > 1.0 or dr.peg_value[1] > 1.0:
+            hue = _rand(dr.peg_hue_shift[0], dr.peg_hue_shift[1]) if dr.peg_hue_shift[1] > dr.peg_hue_shift[0] else 0
+            sat = _rand(dr.peg_saturation[0], dr.peg_saturation[1]) if dr.peg_saturation[1] > 1.0 else 1.0
+            val = _rand(dr.peg_value[0], dr.peg_value[1]) if dr.peg_value[1] > 1.0 else 1.0
+            try:
+                prim = self._held_asset.prim if hasattr(self._held_asset, 'prim') else None
+                if prim is not None:
+                    _randomize_prim_materials(prim, hue_shift=hue, sat_mul=sat, val_mul=val)
+            except Exception:
+                pass
+
+        # ── Table: random roughness / metallic / color shift ──
+        if dr.table_roughness[1] > dr.table_roughness[0] or dr.table_metallic[1] > dr.table_metallic[0] or dr.table_color_shift[1] > 0:
+            try:
+                table_prim_path = "/World/envs/env_0/Table"
+                prim = stage.GetPrimAtPath(table_prim_path)
+                if prim:
+                    roughness = _rand(*dr.table_roughness) if dr.table_roughness[1] > dr.table_roughness[0] else None
+                    metallic = _rand(*dr.table_metallic) if dr.table_metallic[1] > dr.table_metallic[0] else None
+                    shift = dr.table_color_shift[1]
+                    color_delta = (_rand(-shift, shift), _rand(-shift, shift), _rand(-shift, shift)) if shift > 0 else None
+                    _randomize_prim_materials(prim, roughness=roughness, metallic=metallic, color_delta=color_delta)
+            except Exception:
+                pass
+
+        # ── Floor / room: random hue ──
+        if dr.floor_hue_shift[1] > dr.floor_hue_shift[0]:
+            hue = _rand(*dr.floor_hue_shift)
+            try:
+                for path in ("/World/MonteTask/floor_visual", "/World/envs/env_0/floor_visual"):
+                    prim = stage.GetPrimAtPath(path)
+                    if prim:
+                        _randomize_prim_materials(prim, hue_shift=hue, sat_mul=0.8, val_mul=1.0)
+            except Exception:
+                pass
+
+        # ── Fixed asset (hole fixture): random hue ──
+        if dr.fixture_hue_shift[1] > dr.fixture_hue_shift[0]:
+            hue = _rand(*dr.fixture_hue_shift)
+            try:
+                prim = self._fixed_asset.prim if hasattr(self._fixed_asset, 'prim') else None
+                if prim is not None:
+                    _randomize_prim_materials(prim, hue_shift=hue, sat_mul=0.6, val_mul=0.8)
+            except Exception:
+                pass
 
     def randomize_initial_state(self, env_ids):
         """Randomize initial state and perform any episode-level randomization."""

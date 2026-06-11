@@ -1,0 +1,58 @@
+# =============================================================================
+# Stage E — Pretraining Configuration
+# =============================================================================
+# Run on the HOST machine (pure PyTorch, no Isaac Sim).
+#   python pretrain_dynamics.py
+# =============================================================================
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+# Host-side path to the dataset produced by collect_unified_dataset.py.
+data_dir: /home/hanyu/wangyuhan/HIROLRobotPlatform/dependencies/isaaclab/data
+
+# ── Training ─────────────────────────────────────────────────────────────────
+epochs: 300
+batch_size: 32
+lr: 1.0e-4
+weight_decay: 1.0e-4
+num_workers: 4
+seed: 42
+device: cuda
+
+# ── Loss weights ─────────────────────────────────────────────────────────────
+w_dynamics: 1.0
+w_vicreg: 25.0
+# ── Warmup ───────────────────────────────────────────────────────────────────
+warmup_inv_cons: 5       # enable inverse-consistency loss after this epoch
+warmup_vicreg: 5         # enable VICReg after this epoch
+warmup_force_noise: 10   # enable force perturbation after this epoch
+
+# ── Force noise ──────────────────────────────────────────────────────────────
+# Values in raw Newtons (ForceMLP LayerNorm handles scaling).
+# Contact dynamics ~5-20N; σ=1N is mild perturbation, ~5-20% of signal.
+sigma_start: 0.0         # initial σ (N) at warmup start
+sigma_end: 1.0           # final σ (N)
+sigma_start_epoch: 10    # epoch to begin noise anneal
+sigma_end_epoch: 80      # epoch to reach sigma_end
+
+# ── Model ────────────────────────────────────────────────────────────────────
+# Backbone choices:
+#   resnet18       — ResNet-18  (512D,  ~12M frozen params)
+#   resnet50       — ResNet-50  (2048D, ~25M frozen params)
+#   dinov2_vits14  — DINOv2 ViT-S/14 (384D, ~22M frozen params)
+#   dinov2_vitb14  — DINOv2 ViT-B/14 (768D, ~86M frozen params)
+backbone: dinov2_vits14
+pretrained_backbone: true   # load pretrained weights (recommended)
+freeze_backbone: true       # freeze backbone during pretraining
+
+# ── Output ───────────────────────────────────────────────────────────────────
+output_dir: ../../output/pretrain   # relative to this script → isaaclab/output/pretrain/
+early_stop_patience: 30          # stop if val_fwd doesn't improve for N epochs
+
+# ── Ablation flags ───────────────────────────────────────────────────────────
+# Used for the 6-row core ablation (see idea.md §6).
+# Set individual flags to false to disable components.
+ablation:
+  use_visual_dynamics: true    # Δv → Δp_base
+  use_force_dynamics: true     # Δf → Δp_resid + gating
+  use_inverse_consistency: true # bwd pass + L_cons
+  use_vicreg: true             # bottleneck regularisation
