@@ -183,6 +183,100 @@ class PegInsert(FactoryTask):
     )
 
 
+# ── USB-A Insertion ──────────────────────────────────────────────────────────────
+LOCAL_ASSETS = "/workspace/hirol/dependencies/isaaclab/local_factory_assets"
+
+
+@configclass
+class USBA_Plug(HeldAssetCfg):
+    usd_path = f"{LOCAL_ASSETS}/USBA_plug.usdc"
+    diameter = 0.012          # ~12mm wide, used for grip width
+    height = 0.018            # insertion length
+    mass = 0.008              # light plastic plug
+
+
+@configclass
+class USBA_Socket(FixedAssetCfg):
+    usd_path = f"{LOCAL_ASSETS}/USBA_socket.usdc"
+    diameter = 0.014          # socket outer width
+    height = 0.020            # socket depth
+    base_height = 0.0
+
+
+@configclass
+class USBInsert(FactoryTask):
+    name = "usb_insert"
+    fixed_asset_cfg = USBA_Socket()
+    held_asset_cfg = USBA_Plug()
+    asset_size = 12.0
+    duration_s = 10.0
+
+    # Robot
+    hand_init_pos: list = [0.0, 0.0, 0.04]
+    hand_init_pos_noise: list = [0.015, 0.015, 0.008]
+    hand_init_orn: list = [3.1416, 0.0, 0.0]
+    hand_init_orn_noise: list = [0.0, 0.0, 0.785]
+
+    # Fixed asset
+    fixed_asset_init_pos_noise: list = [0.03, 0.03, 0.03]
+    fixed_asset_init_orn_deg: float = 0.0
+    fixed_asset_init_orn_range_deg: float = 360.0
+
+    # Held asset
+    held_asset_pos_noise: list = [0.003, 0.0, 0.003]
+    held_asset_rot_init: float = 0.0
+
+    # Rewards — wider thresholds for 0.5mm tolerance
+    keypoint_coef_baseline: list = [5, 4]
+    keypoint_coef_coarse: list = [50, 2]
+    keypoint_coef_fine: list = [100, 0.1]
+    success_threshold: float = 0.5   # 0.5mm tolerance
+    engage_threshold: float = 0.9
+
+    fixed_asset: ArticulationCfg = ArticulationCfg(
+        prim_path="/World/envs/env_.*/FixedAsset",
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=fixed_asset_cfg.usd_path,
+            activate_contact_sensors=True,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                disable_gravity=False, max_depenetration_velocity=5.0,
+                linear_damping=0.0, angular_damping=0.0,
+                max_linear_velocity=1000.0, max_angular_velocity=3666.0,
+                enable_gyroscopic_forces=True,
+                solver_position_iteration_count=192, solver_velocity_iteration_count=1,
+                max_contact_impulse=1e32,
+            ),
+            mass_props=sim_utils.MassPropertiesCfg(mass=fixed_asset_cfg.mass),
+            collision_props=sim_utils.CollisionPropertiesCfg(contact_offset=0.005, rest_offset=0.0),
+        ),
+        init_state=ArticulationCfg.InitialStateCfg(
+            pos=(0.6, 0.0, 0.05), rot=(1.0, 0.0, 0.0, 0.0), joint_pos={}, joint_vel={}
+        ),
+        actuators={},
+    )
+    held_asset: ArticulationCfg = ArticulationCfg(
+        prim_path="/World/envs/env_.*/HeldAsset",
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=held_asset_cfg.usd_path,
+            activate_contact_sensors=True,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                disable_gravity=False, max_depenetration_velocity=5.0,
+                linear_damping=0.0, angular_damping=0.0,
+                max_linear_velocity=1000.0, max_angular_velocity=3666.0,
+                enable_gyroscopic_forces=True,
+                solver_position_iteration_count=192, solver_velocity_iteration_count=1,
+                max_contact_impulse=1e32,
+            ),
+            mass_props=sim_utils.MassPropertiesCfg(mass=held_asset_cfg.mass),
+            collision_props=sim_utils.CollisionPropertiesCfg(contact_offset=0.005, rest_offset=0.0),
+        ),
+        init_state=ArticulationCfg.InitialStateCfg(
+            pos=(0.0, 0.4, 0.1), rot=(1.0, 0.0, 0.0, 0.0), joint_pos={}, joint_vel={}
+        ),
+        actuators={},
+    )
+
+
 @configclass
 class GearBase(FixedAssetCfg):
     usd_path = f"{ASSET_DIR}/factory_gear_base.usd"

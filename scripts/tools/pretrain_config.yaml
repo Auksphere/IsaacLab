@@ -14,13 +14,15 @@ epochs: 300
 batch_size: 32
 lr: 1.0e-4
 weight_decay: 1.0e-4
-num_workers: 4
+num_workers: 8
 seed: 42
 device: cuda
 
 # ── Loss weights ─────────────────────────────────────────────────────────────
-w_dynamics: 1.0
-w_vicreg: 25.0
+w_dynamics: 5.0
+w_vicreg: 10.0
+w_task: 30.0         # task prediction (held_pos_rel_fixed 3D)
+w_fut: 5.0           # future self-prediction (cosine distance)
 # ── Warmup ───────────────────────────────────────────────────────────────────
 warmup_inv_cons: 5       # enable inverse-consistency loss after this epoch
 warmup_vicreg: 5         # enable VICReg after this epoch
@@ -30,7 +32,7 @@ warmup_force_noise: 10   # enable force perturbation after this epoch
 # Values in raw Newtons (ForceMLP LayerNorm handles scaling).
 # Contact dynamics ~5-20N; σ=1N is mild perturbation, ~5-20% of signal.
 sigma_start: 0.0         # initial σ (N) at warmup start
-sigma_end: 1.0           # final σ (N)
+sigma_end: 2.0           # final σ (N)
 sigma_start_epoch: 10    # epoch to begin noise anneal
 sigma_end_epoch: 80      # epoch to reach sigma_end
 
@@ -43,10 +45,11 @@ sigma_end_epoch: 80      # epoch to reach sigma_end
 backbone: dinov2_vits14
 pretrained_backbone: true   # load pretrained weights (recommended)
 freeze_backbone: true       # freeze backbone during pretraining
+mono: false                  # true = monocular camera (no fusion_mlp)
 
 # ── Output ───────────────────────────────────────────────────────────────────
 output_dir: ../../output/pretrain   # relative to this script → isaaclab/output/pretrain/
-early_stop_patience: 30          # stop if val_fwd doesn't improve for N epochs
+early_stop_patience: 15          # stop if val_fwd doesn't improve for N epochs
 
 # ── Ablation flags ───────────────────────────────────────────────────────────
 # Used for the 6-row core ablation (see idea.md §6).

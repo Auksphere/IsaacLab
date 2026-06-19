@@ -14,7 +14,7 @@ from isaaclab.utils import configclass
 
 from isaaclab.sensors import ContactSensorCfg, TiledCameraCfg
 
-from .factory_tasks_cfg import ASSET_DIR, FactoryTask, GearMesh, NutThread, PegInsert
+from .factory_tasks_cfg import ASSET_DIR, FactoryTask, GearMesh, NutThread, PegInsert, USBInsert
 
 OBS_DIM_CFG = {
     "fingertip_pos": 3,
@@ -336,7 +336,7 @@ class FactoryTaskPegInsertVisionCfg(FactoryTaskPegInsertCfg):
         spawn=sim_utils.PinholeCameraCfg(
             focal_length=15.2, focus_distance=400.0, horizontal_aperture=20.955, clipping_range=(0.01, 2.0)
         ),
-        width=112, height=112,
+        width=224, height=224,
     )
 
     tiled_camera_right: TiledCameraCfg = TiledCameraCfg(
@@ -348,7 +348,7 @@ class FactoryTaskPegInsertVisionCfg(FactoryTaskPegInsertCfg):
         spawn=sim_utils.PinholeCameraCfg(
             focal_length=15.2, focus_distance=400.0, horizontal_aperture=20.955, clipping_range=(0.01, 2.0)
         ),
-        width=112, height=112,
+        width=224, height=224,
     )
 
     # ── Wrist force/torque sensor ──
@@ -359,14 +359,12 @@ class FactoryTaskPegInsertVisionCfg(FactoryTaskPegInsertCfg):
     contact_sensor_fingertip: ContactSensorCfg | None = None
     contact_sensor_held_asset: ContactSensorCfg | None = None
 
-    # Policy obs: matches default FactoryTaskPegInsertCfg (no FT — encoder
-    # mode adds bottleneck features; debug mode uses privileged state).
+    # Policy obs: encoder mode adds bottleneck; debug mode uses privileged state.
     obs_order: list = [
         "fingertip_pos_rel_fixed", "fingertip_quat", "ee_linvel", "ee_angvel",
     ]
 
-    # Critic state: matches default FactoryTaskPegInsertCfg (no hand-tuned
-    # force/contact/engagement thresholds — those were unstable across domains).
+    # Critic state: matches sanity_check checkpoint (43D = 37 + 6 actions).
     state_order: list = [
         "fingertip_pos", "fingertip_quat", "ee_linvel", "ee_angvel",
         "joint_pos", "held_pos", "held_pos_rel_fixed", "held_quat",
@@ -378,7 +376,7 @@ class FactoryTaskPegInsertVisionCfg(FactoryTaskPegInsertCfg):
 class FactoryTaskPegInsertEncoderCfg(FactoryTaskPegInsertVisionCfg):
     """Vision env + frozen pretrained encoder for policy observations.
 
-    Policy obs = [bottleneck(256D), proprio(20D)] = 276D.
+    Policy obs = [bottleneck(256D), proprio(20D), prev_actions(6D)] = 282D.
     Encoder is loaded during FactoryEnv.__init__.
 
     When ``encoder_debug_state_policy`` is True, the actor receives the same
@@ -387,6 +385,101 @@ class FactoryTaskPegInsertEncoderCfg(FactoryTaskPegInsertVisionCfg):
     debugging encoder-feature quality.
     """
 
-    encoder_checkpoint: str = "/workspace/isaaclab/scripts/tools/pretrained_encoder_best.pt"
+    encoder_checkpoint: str = "/workspace/isaaclab/output/pretrain/pretrained_encoder_best.pt"
     encoder_backbone: str = "dinov2_vits14"
     encoder_debug_state_policy: bool = False
+    encoder_ablate_bottleneck: bool = False
+    """If True: no encoder, no cameras. held_pos_rel_fixed(3D) from privileged state.
+    Policy = [held_pos_rel_fixed(3), proprio(20), prev_a(6)] = 29D.
+    Ablation: is the bottleneck providing more spatial info than a 3D delta vector?"""
+    curriculum_pos_alpha_delay_steps: float = 655360   # 80 iters pure GT
+    curriculum_pos_alpha_decay_steps: float = 40960   # 10 iters linear decay
+    curriculum_pos_alpha_success_threshold: float = 0.90  # only decay when success EMA > this
+    encoder_feed_task_pred: bool = False
+    """If True: policy obs includes head_task output (3D). 285D.
+    If False: policy obs = [z(256), proprio(20), prev_a(6)] = 282D (no task_pred)."""
+
+
+@configclass
+@configclass
+class FactoryTaskPegInsertEncoderV7Cfg(FactoryTaskPegInsertVisionCfg):
+    """V7 token-level fusion encoder for RL."""
+    encoder_checkpoint: str = "/workspace/isaaclab/output/pretrain/pretrained_encoder_best.pt"
+    encoder_backbone: str = "dinov2_vits14"
+    encoder_debug_state_policy: bool = False
+    encoder_ablate_bottleneck: bool = False
+    encoder_v7: bool = True
+    # V7 policy obs: z_vis(128)+z_task(64)+z_force(32)+z_gate(8)+proprio(20)+prev_a(6) = 258D
+
+
+@configclass
+class FactoryTaskGearMeshEncoderCfg(FactoryTaskGearMeshCfg):
+    """GearMesh with dual wrist cameras, wrist FT sensor, and frozen encoder.
+    Same vision+FT setup as PegInsertEncoderCfg, different task (gear_mesh).
+    """
+    # ── Cameras ──
+    tiled_camera_left: TiledCameraCfg = TiledCameraCfg(
+        prim_path="/World/envs/env_.*/CameraLeft",
+        offset=TiledCameraCfg.OffsetCfg(
+            pos=(-0.08, -0.01, 0.08), rot=(-0.2706, -0.6533, 0.6533, -0.2706), convention="ros"
+        ),
+        data_types=["rgb"],
+        spawn=sim_utils.PinholeCameraCfg(
+            focal_length=15.2, focus_distance=400.0, horizontal_aperture=20.955, clipping_range=(0.01, 2.0)
+        ),
+        width=224, height=224,
+    )
+    tiled_camera_right: TiledCameraCfg = TiledCameraCfg(
+        prim_path="/World/envs/env_.*/CameraRight",
+        offset=TiledCameraCfg.OffsetCfg(
+            pos=(0.02, 0.0, 0.02), rot=(0.7071, -0.7071, 0.0, 0.0), convention="ros"
+        ),
+        data_types=["rgb"],
+        spawn=sim_utils.PinholeCameraCfg(
+            focal_length=15.2, focus_distance=400.0, horizontal_aperture=20.955, clipping_range=(0.01, 2.0)
+        ),
+        width=224, height=224,
+    )
+
+    # ── Wrist force/torque sensor ──
+    contact_sensor_fingertip: ContactSensorCfg | None = None
+    contact_sensor_held_asset: ContactSensorCfg | None = None
+
+    # ── Obs/State orders (same as peg insert vision) ──
+    obs_order: list = [
+        "fingertip_pos_rel_fixed", "fingertip_quat", "ee_linvel", "ee_angvel",
+    ]
+    state_order: list = [
+        "fingertip_pos", "fingertip_quat", "ee_linvel", "ee_angvel",
+        "joint_pos", "held_pos", "held_pos_rel_fixed", "held_quat",
+        "fixed_pos", "fixed_quat",
+    ]
+
+    # ── Encoder config ──
+    encoder_checkpoint: str = "/workspace/isaaclab/output/pretrain/pretrained_encoder_best.pt"
+    encoder_backbone: str = "dinov2_vits14"
+    encoder_debug_state_policy: bool = False
+    encoder_ablate_bottleneck: bool = False
+    curriculum_pos_alpha_delay_steps: float = 655360
+    curriculum_pos_alpha_decay_steps: float = 163840
+    curriculum_pos_alpha_success_threshold: float = 0.90
+    encoder_feed_task_pred: bool = True
+
+
+@configclass
+class FactoryTaskPegInsertMonoEncoderCfg(FactoryTaskPegInsertEncoderCfg):
+    """PegInsert with monocular camera + frozen encoder.
+
+    Same as stereo encoder but right camera disabled.
+    """
+
+    tiled_camera_right: TiledCameraCfg | None = None
+    encoder_mono: bool = True
+
+
+@configclass
+class FactoryTaskUSBInsertEncoderCfg(FactoryTaskPegInsertEncoderCfg):
+    """USB-A insertion with encoder.  Same vision + FT setup, different mesh pair."""
+
+    task_name: str = "usb_insert"
+    task: FactoryTask = USBInsert()

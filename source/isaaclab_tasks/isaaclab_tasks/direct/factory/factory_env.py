@@ -44,27 +44,29 @@ class FactoryEnv(DirectRLEnv):
         # Stage F encoder mode: override policy/critic obs dims
         encoder_ckpt = getattr(cfg, "encoder_checkpoint", "")
         self._encoder_debug_state_policy = getattr(cfg, "encoder_debug_state_policy", False)
-        if encoder_ckpt:
-            if self._encoder_debug_state_policy:
-                # Debug mode: actor sees same privileged state as critic
-                # (bypasses encoder — sanity check that env/RL pipeline has no bugs)
-                cfg.observation_space = cfg.state_space
-                # Disable cameras — not needed in debug mode, saves ~4x GPU time
+        self._encoder_ablate_bottleneck = getattr(cfg, "encoder_ablate_bottleneck", False)
+        self._curriculum_pos_alpha = 0.0
+        self._curriculum_pos_alpha_delay = 0
+        self._curriculum_pos_alpha_decay_steps = 0
+        self._curriculum_pos_alpha_success_threshold = 0.9
+        self._curriculum_total_steps = 0
+        self._curriculum_decay_progress = 0
+        self._curriculum_curr_success_rate = 0.0
+        if self._encoder_debug_state_policy:
+            # Debug mode: actor sees same privileged state as critic (43D)
+            cfg.observation_space = cfg.state_space
+            if not getattr(cfg, "encoder_debug_keep_cameras", False):
                 cfg.tiled_camera_left = None
                 cfg.tiled_camera_right = None
-            else:
-                # policy = [Δv(vis_dim), Δf(64), proprio(20), prev_action(6)]
-                # vis_dim depends on backbone — hardcoded for now
-                backbone_name = getattr(cfg, "encoder_backbone", "resnet18")
-                if backbone_name == "dinov2_vits14":
-                    vis_dim = 384
-                elif backbone_name == "dinov2_vitb14":
-                    vis_dim = 768
-                elif backbone_name == "resnet50":
-                    vis_dim = 2048
-                else:
-                    vis_dim = 512  # resnet18
-                cfg.observation_space = vis_dim + 64 + 20 + 6
+        elif self._encoder_ablate_bottleneck:
+            # Ablation: no encoder, κ_hat from privileged keypoint_dist
+            # Policy = [κ_hat(1), proprio(20), prev_a(6)] = 27D
+            cfg.observation_space = 29  # held_pos_rel_fixed(3) + proprio(20) + prev_a(6)
+            cfg.tiled_camera_left = None
+            cfg.tiled_camera_right = None
+        elif encoder_ckpt:
+                # Bottleneck(256D) + proprio(20D) + prev_a(6D) = 282D
+                cfg.observation_space = 282
             # critic uses privileged state (same as baseline's 55D) — no override needed
         self.cfg_task = cfg.task
 
@@ -96,29 +98,35 @@ class FactoryEnv(DirectRLEnv):
         self.contact_force_state = torch.zeros((self.num_envs, 4), device=self.device)
         self.engagement_state = torch.zeros((self.num_envs, 1), device=self.device)
 
-        # 3-frame force ring buffer: [F(t-2), F(t-1), F(t)] → (N, 3, 6)
-        self.ft_ring = torch.zeros((self.num_envs, 3, 6), device=self.device)
+        # Raw force ring buffer: K+3 frames for Δf computation
+        # ft_ring[-3:] = current 3-frame, ft_ring[:3] = K steps ago
+        self.K = 3
+        self.ft_ring = torch.zeros((self.num_envs, self.K + 3, 6), device=self.device)
 
         self._compute_intermediate_values(dt=self.physics_dt)
+
+        # Init camera attributes EARLY (before DR) with same defaults as _update_camera_poses
+        self._eye1_local = [-0.08, -0.0, 0.08]
+        self._eye2_local = [0.04, 0.0, 0.02]
+        self._target_left_local = [0.0, 0.0, 0.17]
+        self._target_right_local = [0.0, 0.0, 0.17]
 
         # Load pretrained encoder if checkpoint path is configured.
         # Skip in debug mode — the encoder is never called (policy = critic = state).
         from .encoder import VisualForceEncoder
         encoder_ckpt = getattr(cfg, "encoder_checkpoint", None)
         self._encoder: VisualForceEncoder | None = None
-        if encoder_ckpt is not None and encoder_ckpt != "" and not self._encoder_debug_state_policy:
+        if encoder_ckpt is not None and encoder_ckpt != "" \
+                and not self._encoder_debug_state_policy \
+                and not self._encoder_ablate_bottleneck:
             backbone_name = getattr(cfg, "encoder_backbone", "resnet18")
+            mono = getattr(cfg, "encoder_mono", False)
+            v7 = getattr(cfg, "encoder_v7", False)
             self._encoder = VisualForceEncoder.from_checkpoint(
-                str(encoder_ckpt), backbone_name=backbone_name, device=self.device)
+                str(encoder_ckpt), backbone_name=backbone_name, device=self.device,
+                mono=mono)
             print(f"[INFO] Loaded frozen encoder from {encoder_ckpt} "
                   f"(feature_dim={self._encoder.feature_dim})")
-
-            # Ring buffer for Δ feature computation
-            self.K = 3  # matches pretrain frame-skip
-            fd = self._encoder.feature_dim  # vis_dim + 64
-            self._feat_ring = torch.zeros((self.num_envs, self.K + 1, fd),
-                                          device=self.device)
-            self._feat_ring_ptr = 0
 
     def _apply_render_quality(self):
         """Apply carb render-quality settings from the env config.
@@ -160,6 +168,13 @@ class FactoryEnv(DirectRLEnv):
                 s.set("/rtx/pathtracing/spp", int(spp))
             except Exception:
                 pass
+
+        # Disable post-processing — unnecessary for RL (encoder sees patches, not pixels)
+        try:
+            s.set("/rtx/post/aa/op", 0)        # anti-aliasing off
+            # s.set("/rtx/post/tonemap/op", 0)  # TONE MAPPING KEPT ON — fix white images
+        except Exception:
+            pass
 
     def _set_body_inertias(self):
         """Note: this is to account for the asset_options.armature parameter in IGE."""
@@ -213,7 +228,7 @@ class FactoryEnv(DirectRLEnv):
 
         # Held asset
         held_base_x_offset = 0.0
-        if self.cfg_task.name == "peg_insert":
+        if self.cfg_task.name == "peg_insert" or self.cfg_task.name == "usb_insert":
             held_base_z_offset = 0.0
         elif self.cfg_task.name == "gear_mesh":
             gear_base_offset = self._get_target_gear_base_offset()
@@ -254,7 +269,7 @@ class FactoryEnv(DirectRLEnv):
 
         # Used to compute target poses.
         self.fixed_success_pos_local = torch.zeros((self.num_envs, 3), device=self.device)
-        if self.cfg_task.name == "peg_insert":
+        if self.cfg_task.name == "peg_insert" or self.cfg_task.name == "usb_insert":
             self.fixed_success_pos_local[:, 2] = 0.0
         elif self.cfg_task.name == "gear_mesh":
             gear_base_offset = self._get_target_gear_base_offset()
@@ -409,9 +424,9 @@ class FactoryEnv(DirectRLEnv):
         # optimal scaling from data (sim + real).
         self.force_torque[:, :] = raw_ft
 
-        # 3-frame ring buffer for encoder input: [F(t-2), F(t-1), F(t)]
-        self.ft_ring[:, 0:2, :] = self.ft_ring[:, 1:3, :].clone()
-        self.ft_ring[:, 2, :] = raw_ft
+        # Push to ring buffer
+        self.ft_ring[:, :-1, :] = self.ft_ring[:, 1:, :].clone()
+        self.ft_ring[:, -1, :] = raw_ft
 
         # 5-frame ring buffer (for delta_f computation)
         self.ft_history[:, self.ft_history_ptr, :] = self.force_torque
@@ -467,50 +482,44 @@ class FactoryEnv(DirectRLEnv):
         hand_quat = self._robot.data.body_quat_w[:, self.hand_body_idx]  # (N, 4) wxyz
 
         # 这样就可以不用折腾四元数了，只用规定相机的注视点
-        # Body-local offsets
-        # Use randomised offsets when domain rand is active, else defaults.
-        e1 = getattr(self, "_eye1_local", [-0.08, -0.0, 0.08])
-        e2 = getattr(self, "_eye2_local", [0.08, 0.0, 0.08])
-        tgt = getattr(self, "_target_local", [0.0, 0.0, 0.17])
+        # Body-local offsets — separate targets for each camera
+        e1 = self._eye1_local; e2 = self._eye2_local
+        t1 = self._target_left_local; t2 = self._target_right_local
         eye1_local = torch.tensor(e1, device=self.device)
         eye2_local = torch.tensor(e2, device=self.device)
-        target_local = torch.tensor(tgt, device=self.device)
+        tgt1_local = torch.tensor(t1, device=self.device)
+        tgt2_local = torch.tensor(t2, device=self.device)
 
         # Transform to world frame
         eye1_world = hand_pos + quat_apply(hand_quat, eye1_local.expand_as(hand_pos))
         eye2_world = hand_pos + quat_apply(hand_quat, eye2_local.expand_as(hand_pos))
-        target_world = hand_pos + quat_apply(hand_quat, target_local.expand_as(hand_pos))
+        tgt1_world = hand_pos + quat_apply(hand_quat, tgt1_local.expand_as(hand_pos))
+        tgt2_world = hand_pos + quat_apply(hand_quat, tgt2_local.expand_as(hand_pos))
 
-        # set_world_poses_from_view auto-computes correct camera orientations
-        self._tiled_camera_left.set_world_poses_from_view(eye1_world, target_world)
-        self._tiled_camera_right.set_world_poses_from_view(eye2_world, target_world)
+        self._tiled_camera_left.set_world_poses_from_view(eye1_world, tgt1_world)
+        self._tiled_camera_right.set_world_poses_from_view(eye2_world, tgt2_world)
 
     def _compute_encoder_features(self):
-        """Encode current frame → store in ring buffer → return Δ features.
-
-        Returns Δ concat (N, vis_dim + 64) = [v_t − v_{t−k}, f_t − f_{t−k}].
-        These Δ features received VICReg + dynamics gradients during pretrain.
-        """
+        """Return (z_bottleneck(256D), task_pred(3D)) from pretrained encoder."""
         if self._encoder is None or self._tiled_camera_left is None:
             return None
         from .encoder import preprocess_rgb
-        img_l = self._tiled_camera_left.data.output["rgb"]   # (N, H, W, 3) uint8
-        img_r = self._tiled_camera_right.data.output["rgb"]
-        img_l = preprocess_rgb(img_l)                         # (N, 3, 224, 224) float
-        img_r = preprocess_rgb(img_r)
-        ft_3f = self.ft_ring.view(self.num_envs, 18)          # (N, 18)
+        img_l = preprocess_rgb(self._tiled_camera_left.data.output["rgb"])
+        img_r = None
+        if self._tiled_camera_right is not None:
+            img_r = preprocess_rgb(self._tiled_camera_right.data.output["rgb"])
+
+        ft_3f   = self.ft_ring[:, -3:, :].reshape(self.num_envs, 18)
+        ft_3f_k = self.ft_ring[:, :3, :].reshape(self.num_envs, 18)
+        proprio_20 = torch.cat([
+            self.joint_pos[:, 0:7], self.fingertip_midpoint_pos,
+            self.fingertip_midpoint_quat, self.ee_linvel_fd, self.ee_angvel_fd,
+        ], dim=-1)
 
         with torch.cuda.amp.autocast(enabled=True, dtype=torch.float16):
-            feat_t = self._encoder.forward_features(img_l, img_r, ft_3f)
-
-        # Store current features in ring buffer
-        self._feat_ring[:, self._feat_ring_ptr, :] = feat_t.float()
-        past_ptr = (self._feat_ring_ptr - self.K) % (self.K + 1)
-        feat_past = self._feat_ring[:, past_ptr, :]
-        self._feat_ring_ptr = (self._feat_ring_ptr + 1) % (self.K + 1)
-
-        # Δ = feat_t − feat_{t−k}
-        return feat_t - feat_past
+            z, task_pred = self._encoder.forward_features(
+                img_l, img_r, ft_3f, ft_3f_k, self.raw_actions, proprio_20)
+        return z.float(), task_pred.float()
 
     def _get_observations(self):
         """Get actor/critic inputs.
@@ -556,21 +565,35 @@ class FactoryEnv(DirectRLEnv):
             # Debug mode: actor sees same privileged state as critic.
             critic_obs = torch.cat([state_dict[name] for name in self.cfg.state_order + ["prev_actions"]], dim=-1)
             observations = {"policy": critic_obs, "critic": critic_obs}
+        elif self._encoder_ablate_bottleneck:
+            # Ablation: held_pos_rel_fixed from privileged state, no encoder.
+            # Policy = [held_pos_rel_fixed(3), proprio(20), prev_a(6)] = 29D
+            held_rel = self.held_pos - self.fixed_pos_obs_frame  # peg→hole 3D
+            proprio_20 = torch.cat([
+                self.joint_pos[:, 0:7],
+                self.fingertip_midpoint_pos,
+                self.fingertip_midpoint_quat,
+                self.ee_linvel_fd,
+                self.ee_angvel_fd,
+            ], dim=-1)
+            policy_obs = torch.cat([held_rel, proprio_20, prev_actions], dim=-1)
+            critic_obs = torch.cat([state_dict[name] for name in self.cfg.state_order + ["prev_actions"]], dim=-1)
+            observations = {"policy": policy_obs, "critic": critic_obs}
         else:
-            enc_feat = self._compute_encoder_features()  # (N, vis_dim+64) or None
-            if enc_feat is not None:
-                # Proprio 20D: matches pretraining Δp format
+            enc_out = self._compute_encoder_features()
+            if enc_out is not None:
+                z, task_pred = enc_out
                 proprio_20 = torch.cat([
-                    self.joint_pos[:, 0:7],          # 7
-                    self.fingertip_midpoint_pos,      # 3
-                    self.fingertip_midpoint_quat,     # 4
-                    self.ee_linvel_fd,                # 3
-                    self.ee_angvel_fd,                # 3
+                    self.joint_pos[:, 0:7],
+                    self.fingertip_midpoint_pos,
+                    self.fingertip_midpoint_quat,
+                    self.ee_linvel_fd,
+                    self.ee_angvel_fd,
                 ], dim=-1)
-                policy_obs = torch.cat([enc_feat, proprio_20, prev_actions], dim=-1)
-                # Critic uses clean privileged state (same as baseline's 55D critic).
-                # Bottleneck is actor-only — critic doesn't need visual features.
-                critic_obs = torch.cat([state_dict[name] for name in self.cfg.state_order + ["prev_actions"]], dim=-1)
+                # Policy = [bottleneck(256D), proprio(20D), prev_a(6D)]
+                policy_obs = torch.cat([z, proprio_20, prev_actions], dim=-1)
+                critic_obs = torch.cat(
+                    [state_dict[name] for name in self.cfg.state_order + ["prev_actions"]], dim=-1)
                 observations = {"policy": policy_obs, "critic": critic_obs}
             else:
                 # ── Low-dim observations (backward-compatible) ──
@@ -605,9 +628,8 @@ class FactoryEnv(DirectRLEnv):
     def _reset_buffers(self, env_ids):
         """Reset buffers."""
         self.ep_succeeded[env_ids] = 0
-        # Clear ring buffer for resetting envs — Δ = feat_t for first K steps
-        if hasattr(self, '_feat_ring') and self._feat_ring.shape[0] > 1:
-            self._feat_ring[env_ids] = 0.0
+        # Clear force ring buffer for reset envs
+        self.ft_ring[env_ids] = 0.0
 
     def _pre_physics_step(self, action):
         """Apply policy actions with smoothing."""
@@ -615,8 +637,9 @@ class FactoryEnv(DirectRLEnv):
         if len(env_ids) > 0:
             self._reset_buffers(env_ids)
 
+        self.raw_actions = action.clone().to(self.device)  # before EMA
         self.actions = (
-            self.cfg.ctrl.ema_factor * action.clone().to(self.device) + (1 - self.cfg.ctrl.ema_factor) * self.actions
+            self.cfg.ctrl.ema_factor * self.raw_actions + (1 - self.cfg.ctrl.ema_factor) * self.actions
         )
 
         # Update camera poses BEFORE physics rendering so cameras track the hand
@@ -765,7 +788,7 @@ class FactoryEnv(DirectRLEnv):
         is_centered = torch.where(xy_dist < 0.0025, torch.ones_like(curr_successes), torch.zeros_like(curr_successes))
         # Height threshold to target
         fixed_cfg = self.cfg_task.fixed_asset_cfg
-        if self.cfg_task.name == "peg_insert" or self.cfg_task.name == "gear_mesh":
+        if self.cfg_task.name in ("peg_insert", "gear_mesh", "usb_insert"):
             height_threshold = fixed_cfg.height * success_threshold
         elif self.cfg_task.name == "nut_thread":
             height_threshold = fixed_cfg.thread_pitch * success_threshold
@@ -809,6 +832,8 @@ class FactoryEnv(DirectRLEnv):
             self.extras["success_times"] = success_times
 
         self.prev_actions = self.actions.clone()
+        # Store current success for curriculum (consumed by _get_observations next call)
+        self._curriculum_curr_success_rate = curr_successes.float().mean().item()
         return rew_buf
 
     def _update_rew_buf(self, curr_successes):
@@ -942,7 +967,7 @@ class FactoryEnv(DirectRLEnv):
 
     def get_handheld_asset_relative_pose(self):
         """Get default relative pose between help asset and fingertip."""
-        if self.cfg_task.name == "peg_insert":
+        if self.cfg_task.name in ("peg_insert", "usb_insert"):
             held_asset_relative_pos = torch.zeros_like(self.held_base_pos_local)
             held_asset_relative_pos[:, 2] = self.cfg_task.held_asset_cfg.height
             held_asset_relative_pos[:, 2] -= self.cfg_task.robot_cfg.franka_fingerpad_length
@@ -1022,12 +1047,13 @@ class FactoryEnv(DirectRLEnv):
 
         # ── Camera position noise (modify eye_local) ──
         if self._tiled_camera_left is not None:
-            # Store original offsets
+            # Read orig from current values (set by _update_camera_poses defaults)
             if not hasattr(self, "_eye1_local_orig"):
-                # Use the offsets that _update_camera_poses uses
-                self._eye1_local_orig = [-0.08, -0.0, 0.08]
-                self._eye2_local_orig = [0.08, 0.0, 0.08]
-                self._target_local_orig = [0.0, 0.0, 0.17]
+                # Copy from current values (set in __init__)
+                self._eye1_local_orig = list(self._eye1_local)
+                self._eye2_local_orig = list(self._eye2_local)
+                self._target_left_local_orig = list(self._target_left_local)
+                self._target_right_local_orig = list(self._target_right_local)
 
             cp = dr.camera_pos_noise
             ct = dr.camera_target_noise
@@ -1041,10 +1067,15 @@ class FactoryEnv(DirectRLEnv):
                 self._eye2_local_orig[1] + _uniform(-cp[1], cp[1]),
                 self._eye2_local_orig[2] + _uniform(-cp[2], cp[2]),
             ]
-            self._target_local = [
-                self._target_local_orig[0] + _uniform(-ct[0], ct[0]),
-                self._target_local_orig[1] + _uniform(-ct[1], ct[1]),
-                self._target_local_orig[2] + _uniform(-ct[2], ct[2]),
+            self._target_left_local = [
+                self._target_left_local_orig[0] + _uniform(-ct[0], ct[0]),
+                self._target_left_local_orig[1] + _uniform(-ct[1], ct[1]),
+                self._target_left_local_orig[2] + _uniform(-ct[2], ct[2]),
+            ]
+            self._target_right_local = [
+                self._target_right_local_orig[0] + _uniform(-ct[0], ct[0]),
+                self._target_right_local_orig[1] + _uniform(-ct[1], ct[1]),
+                self._target_right_local_orig[2] + _uniform(-ct[2], ct[2]),
             ]
 
         # ── Physics: mass randomization ──
@@ -1432,7 +1463,11 @@ class FactoryEnv(DirectRLEnv):
 
         # Set initial actions to involve no-movement. Needed for EMA/correct penalties.
         self.actions = torch.zeros_like(self.actions)
+        self.raw_actions = torch.zeros_like(self.actions)
         self.prev_actions = torch.zeros_like(self.actions)
+        # Reset encoder visual cache (Δv = v_t - prev_v_t needs clean start)
+        if self._encoder is not None:
+            self._encoder.reset(env_ids)
         # Back out what actions should be for initial state.
         # Relative position to bolt tip.
         self.fixed_pos_action_frame[:] = self.fixed_pos_obs_frame + self.init_fixed_pos_obs_noise

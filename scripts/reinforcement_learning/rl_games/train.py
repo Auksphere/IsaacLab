@@ -150,6 +150,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # wrap around environment for rl-games
     env = RlGamesVecEnvWrapper(env, rl_device, clip_obs, clip_actions)
 
+    # LfD demo mixing: load demo buffer for expert trajectory injection
+    demo_data_path = agent_cfg["params"]["config"].get("demo_data_path", "")
+    if demo_data_path:
+        from isaaclab_rl.demo_buffer import DemoBuffer
+        demo_buffer = DemoBuffer(demo_data_path, device=rl_device)
+        agent_cfg["params"]["config"]["demo_buffer"] = demo_buffer
+        print("[LfD] Demo buffer injected into config")
+
     # register the environment to rl-games registry
     # note: in agents configuration: environment name must be "rlgpu"
     vecenv.register(

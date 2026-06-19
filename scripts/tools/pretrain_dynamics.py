@@ -151,8 +151,21 @@ class StageEDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         info = self._samples[idx]
-        ep = self._episodes(info["ep_id"])
+        ep_id = info["ep_id"]
+        ep = self._episodes(ep_id)
         t, t_k = info["t"], info["t_k"]
+
+        # τ_t: 0.95^(steps to first success), then 1.0 after success
+        first_succ = next((i for i, r in enumerate(ep) if r.get("keypoint_dist", 1.0) < 0.002), None)
+        if first_succ is not None:
+            steps_to = max(0, first_succ - t)
+            tau = 1.0 if t >= first_succ else 0.80 ** steps_to
+        else:
+            tau = 0.0
+
+        # Task target: held_pos_rel_fixed (peg→hole 3D offset) from JSONL → mm
+        held_rel = ep[t].get("held_pos_rel_fixed", [0.0, 0.0, 0.0])
+        held_rel = torch.tensor([float(v) * 1000 for v in held_rel[:3]], dtype=torch.float32)
 
         return {
             "img_left_t":   self._load_3frame_rgb(ep, t,   "camera_left"),
@@ -163,7 +176,9 @@ class StageEDataset(Dataset):
             "ft_tk":        self._load_3frame_ft(ep, t_k),
             "p_t":          self._load_proprio(ep, t),
             "p_tk":         self._load_proprio(ep, t_k),
-            "a":            self._load_action(ep, t),
+            "a":            self._load_action(ep, max(0, t - 1)),  # prev action (matches RL)
+            "tau":          torch.tensor(tau, dtype=torch.float32),
+            "held_pos_rel_fixed": held_rel,  # task target (3D)
             "ep_id":        torch.tensor(info["ep_id"]),
             "t":            torch.tensor(t),
         }
@@ -365,10 +380,16 @@ class SymmetricDynamicsEncoder(nn.Module):
     """
 
     def __init__(self, backbone_name: str = "resnet18",
-                 pretrained: bool = True, freeze_backbone: bool = True):
+                 pretrained: bool = True, freeze_backbone: bool = True,
+                 mono: bool = False):
         super().__init__()
+        self._mono = mono
         self._backbone, self._vis_dim, self._encode_frame_fn = \
             _build_backbone(backbone_name, pretrained, freeze_backbone)
+
+        # Task output normalization (set externally via set_task_norm)
+        self.register_buffer("task_mean", torch.zeros(3))
+        self.register_buffer("task_std", torch.ones(3))
 
         vis_dim = self._vis_dim
 
@@ -378,28 +399,42 @@ class SymmetricDynamicsEncoder(nn.Module):
             nn.GELU(),
             nn.Linear(vis_dim, vis_dim),
         )
-        # Dual-camera fusion: 2·vis_dim → vis_dim (adaptive soft-selection)
-        self.fusion_mlp = nn.Sequential(
-            nn.Linear(2 * vis_dim, vis_dim),
-            nn.GELU(),
-            nn.Linear(vis_dim, vis_dim),
-        )
+        # Dual-camera fusion (stereo only)
+        if not mono:
+            self.fusion_mlp = nn.Sequential(
+                nn.Linear(2 * vis_dim, vis_dim),
+                nn.GELU(),
+                nn.Linear(vis_dim, vis_dim),
+            )
+        else:
+            self.fusion_mlp = None
 
         # Force pathway (LayerNorm learns input scaling — no hand-coded normalisation)
-        self.force_mlp = nn.Sequential(           # 18 → 64 → 64
+        self.force_mlp = nn.Sequential(           # 18 → 128 → 64
             nn.LayerNorm(18),
-            nn.Linear(18, 64),
+            nn.Linear(18, 128),
             nn.GELU(),
-            nn.Linear(64, 64),
+            nn.Linear(128, 64),
         )
 
-        # VICReg acts directly on [Δv, Δf] concat (vis_dim + 64)
-        # — no bottleneck needed.  RL consumes the same Δ feature.
-        # self._vis_dim is set by _build_backbone; feature_dim is a property.
+        # Bottleneck: [v_t, Δv, Δf] → 256D (motion-aware, action-agnostic)
+        self.bottleneck = nn.Sequential(
+            nn.Linear(vis_dim * 2 + 64, 256),
+            nn.GELU(),
+            nn.Linear(256, 256),
+        )
 
-        # Dynamics heads — full causal context: Δ + action + proprio
-        #   Δv(vis_dim) + a(6) + p(20) = vis_dim + 26
-        #   Δf(64) + a(6) + p(20) = 90
+        # Task head: [bottleneck, proprio] → held_pos_rel_fixed (3D peg→hole offset)
+        self.head_task = nn.Sequential(
+            nn.Linear(256 + 20, 128), nn.GELU(), nn.Linear(128, 3))
+
+        # Future prediction head: bottleneck → ẑ_{t+K} (BYOL-style)
+        self.head_future = nn.Sequential(
+            nn.Linear(256, 256), nn.GELU(), nn.Linear(256, 256))
+
+        # Dynamics heads:
+        #   head_vis:  Δv(vis_dim) + a(6) + p(20) = vis_dim + 26  ← visual delta (like copy)
+        #   head_force: Δf(64) + a(6) + p(20) = 90
         self.dynamics_head_vis = nn.Sequential(
             nn.Linear(vis_dim + 26, max(vis_dim // 2, 64)), nn.GELU(),
             nn.Linear(max(vis_dim // 2, 64), 128), nn.GELU(),
@@ -418,21 +453,16 @@ class SymmetricDynamicsEncoder(nn.Module):
             nn.Linear(32, 1), nn.Sigmoid(),
         )
 
-    def encode_visual(self, imgs_left: torch.Tensor, imgs_right: torch.Tensor) -> torch.Tensor:
-        """Encode last frame of dual-camera 3-frame stack → v_single (vis_dim).
-
-        Per-frame (left + right): backbone → proj_mlp → FusionMLP → vis_dim.
-        Returns the LAST frame only — used for AFRO-style differencing
-        (Δv = v_t − v_{t-k}, single-frame subtraction prevents feature leakage).
-        ForceMLP's f_stack carries temporal context into the Δ features.
-        """
-        # Take only the last frame of each 3-frame stack
+    def encode_visual(self, imgs_left: torch.Tensor,
+                       imgs_right: torch.Tensor = None) -> torch.Tensor:
+        """Encode last frame → v_single (vis_dim). Mono: single camera, no fusion."""
         xl = imgs_left[:, -1, :, :, :]           # (B, 3, H, W)
-        xr = imgs_right[:, -1, :, :, :]
-
         fl = self.proj_mlp(self._encode_frame_fn(xl))           # (B, vis_dim)
-        fr = self.proj_mlp(self._encode_frame_fn(xr))           # (B, vis_dim)
-        return self.fusion_mlp(torch.cat([fl, fr], dim=-1))     # (B, vis_dim)
+        if self.fusion_mlp is not None and imgs_right is not None:
+            xr = imgs_right[:, -1, :, :, :]
+            fr = self.proj_mlp(self._encode_frame_fn(xr))
+            return self.fusion_mlp(torch.cat([fl, fr], dim=-1))  # (B, vis_dim)
+        return fl                                                # mono: direct
 
     def encode_force(self, ft: torch.Tensor) -> torch.Tensor:
         """Encode 3-frame force → f_stack (64D).
@@ -449,46 +479,44 @@ class SymmetricDynamicsEncoder(nn.Module):
                          a: torch.Tensor,
                          p_t: torch.Tensor, p_tk: torch.Tensor,
                          ) -> Dict[str, torch.Tensor]:
-        """Forward pass for pretraining — returns Δp predictions and gates.
+        """Forward pass for pretraining — returns Δp, bottleneck, prog/future preds.
 
-        One transition pair → one action.  Backward negates the action:
-          fwd: [ Δv,  a, p_t]   → Δp_base_fwd   |   [ Δf,  a, p_t]   → Δp_resid_fwd   |   [ Δf,  a] → α_fwd
-          bwd: [−Δv, −a, p_tk] → Δp_base_bwd   |   [−Δf, −a, p_tk] → Δp_resid_bwd   |   [−Δf, −a] → α_bwd
-
-        Consistency loss MSE(Δp_fwd, −Δp_bwd) is valid because the only
-        difference between the two predictions is the sign of the causal input.
+        Bottleneck receives [v_t, Δf, a, p] — full causal context for task progress.
+        Dynamics heads unchanged (bypass architecture).
         """
-        # Encode (single-frame, AFRO-style)
+        # Encode (single-frame)
         v_t   = self.encode_visual(img_left_t,  img_right_t)
         v_tk  = self.encode_visual(img_left_tk, img_right_tk)
         f_t   = self.encode_force(ft_t)
         f_tk  = self.encode_force(ft_tk)
 
-        # Deltas
+        # Visual + force deltas (AFRO-style differencing, matches copy)
         Δv = v_t - v_tk                                             # (B, vis_dim)
         Δf = f_t - f_tk                                             # (B, 64)
 
-        # Causal contexts: fwd uses +ΔX, +a; bwd uses −ΔX, −a (same transition, reversed)
-        ctx_vis_fwd   = torch.cat([Δv,   a,  p_t],  dim=-1)        # (B, vis_dim+26)
+        # Bottleneck: [visual, visual-delta, force-delta] — motion-aware
+        z_t  = self.bottleneck(torch.cat([v_t,  Δv, Δf], dim=-1))   # (B, 256)
+        z_tk = self.bottleneck(torch.cat([v_tk, Δv, Δf], dim=-1))   # past bottleneck
+
+        # Task prediction: bottleneck + proprio bypass → held_pos_rel_fixed (3D, normalized)
+        task_pred = self.head_task(torch.cat([z_t, p_t], dim=-1))   # (B, 3) — raw output (learns internal norm)
+        z_fut = self.head_future(z_tk)                              # predict z_t from z_{t-k}
+
+        # Causal contexts: Δv for visual head (matches copy), Δf for force head
+        ctx_vis_fwd   = torch.cat([Δv,   a,  p_t],  dim=-1)
         ctx_vis_bwd   = torch.cat([-Δv, -a,  p_tk], dim=-1)
-        ctx_force_fwd = torch.cat([Δf,   a,  p_t],  dim=-1)        # (B, 90)
+        ctx_force_fwd = torch.cat([Δf,   a,  p_t],  dim=-1)
         ctx_force_bwd = torch.cat([-Δf, -a,  p_tk], dim=-1)
-        ctx_gate_fwd  = torch.cat([Δf,   a], dim=-1)               # (B, 70)
+        ctx_gate_fwd  = torch.cat([Δf,   a], dim=-1)
         ctx_gate_bwd  = torch.cat([-Δf, -a], dim=-1)
 
-        # Base predictions
-        Δp_base_fwd = self.dynamics_head_vis(ctx_vis_fwd)          # (B, 20)
-        Δp_base_bwd = self.dynamics_head_vis(ctx_vis_bwd)          # (B, 20)
-
-        # Force residuals
-        Δp_resid_fwd = self.dynamics_head_force(ctx_force_fwd)     # (B, 20)
-        Δp_resid_bwd = self.dynamics_head_force(ctx_force_bwd)     # (B, 20)
-
-        # Gates
-        α_fwd = self.gate_mlp(ctx_gate_fwd)                         # (B, 1)
-        α_bwd = self.gate_mlp(ctx_gate_bwd)                         # (B, 1)
-
-        # Fused predictions
+        # Dynamics predictions (unchanged)
+        Δp_base_fwd = self.dynamics_head_vis(ctx_vis_fwd)
+        Δp_base_bwd = self.dynamics_head_vis(ctx_vis_bwd)
+        Δp_resid_fwd = self.dynamics_head_force(ctx_force_fwd)
+        Δp_resid_bwd = self.dynamics_head_force(ctx_force_bwd)
+        α_fwd = self.gate_mlp(ctx_gate_fwd)
+        α_bwd = self.gate_mlp(ctx_gate_bwd)
         Δp_hat_fwd = (1 - α_fwd) * Δp_base_fwd + α_fwd * Δp_resid_fwd
         Δp_hat_bwd = (1 - α_bwd) * Δp_base_bwd + α_bwd * Δp_resid_bwd
 
@@ -497,20 +525,21 @@ class SymmetricDynamicsEncoder(nn.Module):
             "Δp_base_fwd": Δp_base_fwd, "Δp_base_bwd": Δp_base_bwd,
             "Δp_resid_fwd": Δp_resid_fwd, "Δp_resid_bwd": Δp_resid_bwd,
             "α_fwd": α_fwd, "α_bwd": α_bwd,
-            "v_t": v_t, "v_tk": v_tk,
-            "f_t": f_t, "f_tk": f_tk,
+            "v_t": v_t, "v_tk": v_tk, "Δv": Δv, "Δf": Δf,
+            "z_t": z_t, "task_pred": task_pred, "z_fut": z_fut,
         }
 
     def get_inference_state_dict(self) -> Dict[str, torch.Tensor]:
         """Return state_dict for downstream RL: backbone + ProjMLP + FusionMLP
-        + ForceMLP → outputs vis_dim + 64 (Δ concat).  No bottleneck."""
+        + ForceMLP + Bottleneck + head_prog → outputs (256D, 1D)."""
         return {k: v for k, v in self.state_dict().items()
-                if not k.startswith("dynamics_head_") and not k.startswith("gate_mlp.")}
+                if not k.startswith("dynamics_head_") and not k.startswith("gate_mlp.")
+                and not k.startswith("head_future.")}  # keeps head_task, bottleneck, etc.
 
     @property
     def feature_dim(self) -> int:
-        """Dimension of the Δ-concat feature RL receives."""
-        return self._vis_dim + 64
+        """Dimension of the bottleneck feature RL receives."""
+        return 256
 
 
 # =============================================================================
@@ -519,7 +548,7 @@ class SymmetricDynamicsEncoder(nn.Module):
 
 def train_epoch(model, dataloader, optimizer, device, epoch,
                 dp_scale: torch.Tensor = None,
-                w_dynamics=1.0, w_vicreg=0.3,
+                w_dynamics=1.0, w_vicreg=0.3, w_task=1.0, w_fut=0.5,
                 warmup_inv_cons=5, warmup_vicreg=5, warmup_force_noise=10,
                 sigma_drift=0.05, sigma_coupled=0.1, sigma_white=0.1,
                 ) -> Dict[str, float]:
@@ -541,26 +570,27 @@ def train_epoch(model, dataloader, optimizer, device, epoch,
         p_t   = batch["p_t"].to(device)
         p_tk  = batch["p_tk"].to(device)
         a     = batch["a"].to(device)
+        held_rel_gt = batch["held_pos_rel_fixed"].to(device)        # (B, 3)
         B = il_t.shape[0]
-        Δp_gt = (p_t - p_tk) / dp_scale  # per-dim normalised
+        Δp_gt = (p_t - p_tk) / dp_scale
 
-        # Dynamics forward + backward + consistency
-        # One transition pair → one action a.  Backward negates a, Δv, Δf.
-        # Consistency MSE(Δp_fwd, −Δp_bwd) is valid because the only
-        # difference between the two predictions is the sign of the input.
+        # Dynamics
         out = model.forward_pretrain(il_t, ir_t, il_tk, ir_tk, ft_t, ft_tk,
                                      a, p_t, p_tk)
-        # Huber (smooth L1) — robust to contact-event outliers that dominate MSE
         L_fwd = F.smooth_l1_loss(out["Δp_hat_fwd"] / dp_scale, Δp_gt)
         L_bwd = F.smooth_l1_loss(out["Δp_hat_bwd"] / dp_scale, -Δp_gt)
         L_cons = F.smooth_l1_loss(out["Δp_hat_fwd"] / dp_scale, -out["Δp_hat_bwd"] / dp_scale)
         L_dyn = L_fwd + L_bwd + inv_r * L_cons
 
-        # VICReg directly on [Δv, Δf] (no bottleneck — idea.md §3.5 modified):
-        #   Path 1 (clean):  aug_vis_1 on both t & t-k, F_clean  → [Δv1, Δf1]
-        #   Path 2 (pert):   aug_vis_2 on both t & t-k, F_noisy  → [Δv2, Δf2]
-        #   VICReg([Δv1,Δf1], [Δv2,Δf2]) — encodes the same Δp regardless of
-        #   visual/force domain shift.  The same Δ features are consumed by RL.
+        # Task prediction (held_pos_rel_fixed 3D, normalized target)
+        held_rel_norm = (held_rel_gt - model.task_mean) / model.task_std
+        L_task = F.huber_loss(out["task_pred"], held_rel_norm)
+        # Cosine distance: scale-invariant, large signals for small angular changes
+        z_fut_n = F.normalize(out["z_fut"], dim=-1)
+        z_tgt_n = F.normalize(out["z_t"].detach(), dim=-1)
+        L_fut = 2 - 2 * (z_fut_n * z_tgt_n).sum(dim=-1).mean()  # cosine distance ∈ [0, 4]
+
+        # VICReg: bottleneck from two visual+force perturbations
         if use_vic:
             # Force perturbation (t and t-k)
             ft_t_noisy = add_force_noise(
@@ -576,43 +606,36 @@ def train_epoch(model, dataloader, optimizer, device, epoch,
                 sigma_white=sigma_white if use_fn else 0.0,
             ).view(B, -1)
 
-            # Visual perturbation on t and t-k frames (same aug per path)
-            il_t_last  = il_t[:, -1, :, :, :];  ir_t_last  = ir_t[:, -1, :, :, :]
-            il_tk_last = il_tk[:, -1, :, :, :]; ir_tk_last = ir_tk[:, -1, :, :, :]
+            # Visual perturbation — t-frame only, two augmentations
+            il_last = il_t[:, -1, :, :, :];  ir_last = ir_t[:, -1, :, :, :]
+            il_a1 = sim2real_visual_augment(il_last)
+            ir_a1 = sim2real_visual_augment(ir_last)
+            il_a2 = sim2real_visual_augment(il_last)
+            ir_a2 = sim2real_visual_augment(ir_last)
 
-            # Path 1
-            il_t_a1  = sim2real_visual_augment(il_t_last)
-            ir_t_a1  = sim2real_visual_augment(ir_t_last)
-            il_tk_a1 = sim2real_visual_augment(il_tk_last)
-            ir_tk_a1 = sim2real_visual_augment(ir_tk_last)
+            v_t1 = model.encode_visual(il_a1.unsqueeze(1), ir_a1.unsqueeze(1))
+            v_t2 = model.encode_visual(il_a2.unsqueeze(1), ir_a2.unsqueeze(1))
 
-            # Path 2
-            il_t_a2  = sim2real_visual_augment(il_t_last)
-            ir_t_a2  = sim2real_visual_augment(ir_t_last)
-            il_tk_a2 = sim2real_visual_augment(il_tk_last)
-            ir_tk_a2 = sim2real_visual_augment(ir_tk_last)
+            # Force deltas
+            f_t   = model.encode_force(ft_t)
+            f_tk  = model.encode_force(ft_tk)
+            f_t_n = model.encode_force(ft_t_noisy)
+            f_tk_n = model.encode_force(ft_tk_noisy)
+            Δf1 = f_t - f_tk
+            Δf2 = f_t_n - f_tk_n
 
-            v_t1  = model.encode_visual(il_t_a1.unsqueeze(1),  ir_t_a1.unsqueeze(1))
-            v_tk1 = model.encode_visual(il_tk_a1.unsqueeze(1), ir_tk_a1.unsqueeze(1))
-            v_t2  = model.encode_visual(il_t_a2.unsqueeze(1),  ir_t_a2.unsqueeze(1))
-            v_tk2 = model.encode_visual(il_tk_a2.unsqueeze(1), ir_tk_a2.unsqueeze(1))
+            # Visual deltas (t-frame augmented, t-k frame clean from forward pass)
+            Δv1 = v_t1 - out["v_tk"]
+            Δv2 = v_t2 - out["v_tk"]
 
-            f_t1   = model.encode_force(ft_t)
-            f_tk1  = model.encode_force(ft_tk)
-            f_t2   = model.encode_force(ft_t_noisy)
-            f_tk2  = model.encode_force(ft_tk_noisy)
-
-            Δv1 = v_t1 - v_tk1;  Δf1 = f_t1 - f_tk1
-            Δv2 = v_t2 - v_tk2;  Δf2 = f_t2 - f_tk2
-
-            b1 = torch.cat([Δv1, Δf1], dim=-1)  # (B, vis_dim + 64)
-            b2 = torch.cat([Δv2, Δf2], dim=-1)
+            b1 = model.bottleneck(torch.cat([v_t1, Δv1, Δf1], dim=-1))
+            b2 = model.bottleneck(torch.cat([v_t2, Δv2, Δf2], dim=-1))
             L_vic, vc = vicreg_loss(b1, b2, lambda_var=0.33, lambda_cov=0.33)
         else:
             L_vic = torch.tensor(0.0, device=device)
             vc = {"inv": 0.0, "var": 0.0, "cov": 0.0}
 
-        loss = w_dynamics * L_dyn + w_vicreg * L_vic
+        loss = w_dynamics * L_dyn + w_vicreg * L_vic + w_task * L_task + w_fut * L_fut
 
         optimizer.zero_grad()
         loss.backward()
@@ -623,13 +646,15 @@ def train_epoch(model, dataloader, optimizer, device, epoch,
         mets["fwd"]   += L_fwd.item()
         mets["bwd"]   += L_bwd.item()
         mets["cons"]  += L_cons.item()
+        mets["task"]  += L_task.item()
+        mets["fut"]   += L_fut.item()
         mets["vic"]   += L_vic.item()
         mets["a_fwd"] += out["α_fwd"].mean().item()
         for k, v in vc.items():
             mets[f"vic_{k}"] += v
 
         pbar.set_postfix(L=f"{loss.item():.4f}", fwd=f"{L_fwd.item():.4f}",
-                         bwd=f"{L_bwd.item():.4f}", α=f"{out['α_fwd'].mean().item():.2f}")
+                         task=f"{L_task.item():.4f}")
 
     n = max(1, len(dataloader))
     return {k: v / n for k, v in mets.items()}
@@ -649,6 +674,7 @@ def validate(model, dataloader, device, dp_scale: torch.Tensor) -> Dict[str, flo
         p_t   = batch["p_t"].to(device)
         p_tk  = batch["p_tk"].to(device)
         a     = batch["a"].to(device)
+        held_rel_gt = batch["held_pos_rel_fixed"].to(device)  # (B, 3)
 
         out = model.forward_pretrain(il_t, ir_t, il_tk, ir_tk, ft_t, ft_tk,
                                      a, p_t, p_tk)
@@ -656,6 +682,9 @@ def validate(model, dataloader, device, dp_scale: torch.Tensor) -> Dict[str, flo
         mets["fwd"] += F.smooth_l1_loss(out["Δp_hat_fwd"] / dp_scale, Δp_gt).item()
         mets["bwd"] += F.smooth_l1_loss(out["Δp_hat_bwd"] / dp_scale, -Δp_gt).item()
         mets["α"]   += out["α_fwd"].mean().item()
+        # Task prediction L2 error (mm): de-normalize pred, GT is already mm
+        task_pred_mm = out["task_pred"] * model.task_std + model.task_mean
+        mets["task_l2_mm"] += torch.sqrt(F.mse_loss(task_pred_mm, held_rel_gt)).item()
 
     n = max(1, len(dataloader))
     return {k: v / n for k, v in mets.items()}
@@ -719,6 +748,8 @@ def main():
         weight_decay=_get("weight_decay", 1e-4),
         w_dynamics=_get("w_dynamics", 1.0),
         w_vicreg=_get("w_vicreg", 0.3),
+        w_task=_get("w_task", 1.0),
+        w_fut=_get("w_fut", 0.5),
         sigma_end=_get("sigma_end", 2.0),
         warmup_inv_cons=_get("warmup_inv_cons", 5),
         warmup_vicreg=_get("warmup_vicreg", 5),
@@ -734,6 +765,7 @@ def main():
         backbone=pt.get("backbone", "resnet18"),
         pretrained_backbone=pt.get("pretrained_backbone", True),
         freeze_backbone=pt.get("freeze_backbone", True),
+        mono=pt.get("mono", False),
     )
 
     torch.manual_seed(args.seed); np.random.seed(args.seed)
@@ -766,11 +798,17 @@ def main():
 
     # Per-dim Δp std for loss normalisation (avoids trivial zero-prediction)
     _dps = []
+    _held_rels = []
     for i in range(min(500, len(ds_train))):
         s = ds_train[i]
         _dps.append(s["p_t"] - s["p_tk"])
+        _held_rels.append(s["held_pos_rel_fixed"])
     dp_scale = torch.stack(_dps).std().to(device) + 1e-8  # scalar RMS
+    held_rel = torch.stack(_held_rels)
+    task_mean = held_rel.mean(dim=0).to(device)            # (3,) — per-dim mean
+    task_std  = held_rel.std(dim=0).clamp(min=1e-4).to(device)  # (3,) — per-dim std
     print(f"Δp overall RMS: {dp_scale.item():.5f}")
+    print(f"held_pos_rel_fixed mean: {task_mean.tolist()} std: {task_std.tolist()}")
 
     dl_train = DataLoader(ds_train, batch_size=args.batch_size, shuffle=True,
                           num_workers=args.num_workers, pin_memory=True, drop_last=True)
@@ -782,15 +820,20 @@ def main():
         backbone_name=args.backbone,
         pretrained=args.pretrained_backbone,
         freeze_backbone=args.freeze_backbone,
+        mono=args.mono,
     ).to(device)
+    model.task_mean.copy_(task_mean)
+    model.task_std.copy_(task_std)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Backbone: {args.backbone} ({model._vis_dim}D), "
           f"trainable: {n_params:,} params (~{n_params/1000:.0f}K)")
+    print(f"Task norm: mean={task_mean.tolist()} std={task_std.tolist()}")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=15)
 
     best_val_fwd = float("inf")
+    best_combined = float("inf")
     early_stop_patience = pt.get("early_stop_patience", 0)
     no_improve_count = 0
     t0 = time.time()
@@ -801,6 +844,8 @@ def main():
             model, dl_train, optimizer, device, epoch,
             w_dynamics=args.w_dynamics,
             w_vicreg=args.w_vicreg if epoch >= args.warmup_vicreg else 0.0,
+            w_task=args.w_task,
+            w_fut=args.w_fut,
             warmup_inv_cons=args.warmup_inv_cons,
             warmup_vicreg=args.warmup_vicreg,
             warmup_force_noise=args.warmup_force_noise,
@@ -820,24 +865,29 @@ def main():
 
         vic_var = train_m.get("vic_var", 0)
         print(f"Epoch {epoch:3d} | Σ {train_m['total']:.4f} fwd={train_m['fwd']:.4f} "
-              f"bwd={train_m['bwd']:.4f} cons={train_m['cons']:.4f} "
-              f"val_fwd={val_m['fwd']:.4f} α={train_m['a_fwd']:.3f} σ={s:.1f} "
+              f"task={train_m.get('task',0):.4f} "
+              f"fut={train_m.get('fut',0):.4f} "
+              f"val_fwd={val_m['fwd']:.4f} val_task={val_m.get('task_l2_mm',0):.2f}mm "
+              f"α={train_m['a_fwd']:.3f} σ={s:.1f} "
               f"vic=[i={train_m.get('vic_inv',0):.3f} v={vic_var:.3f} c={train_m.get('vic_cov',0):.3f}] "
               f"lr={optimizer.param_groups[0]['lr']:.2e} {elapsed:.0f}s")
         if vic_var < 0.01 and epoch > args.warmup_vicreg:
             print(f"  ⚠ VICReg var={vic_var:.4f} → features may be collapsing. "
                   f"Consider increasing w_vicreg.")
 
-        # Early stopping / best checkpoint on val_fwd
+        # Early stopping / best checkpoint: combined val_fwd + val_task_l2_mm
         no_improve_count += 1
-        if val_m["fwd"] < best_val_fwd:
+        val_task = val_m.get("task_l2_mm", float("inf"))
+        combined_score = val_m["fwd"] + 0.1 * val_task  # weight task error
+        if combined_score < best_combined:
+            best_combined = combined_score
             best_val_fwd = val_m["fwd"]
             no_improve_count = 0
             torch.save(model.get_inference_state_dict(), output_dir / "pretrained_encoder_best.pt")
-            print(f"  → best (val_fwd={val_m['fwd']:.4f})")
+            print(f"  → best (val_fwd={val_m['fwd']:.4f} task_l2={val_task:.2f}mm combined={combined_score:.4f})")
         if early_stop_patience > 0 and no_improve_count >= early_stop_patience:
-            print(f"Early stop at epoch {epoch}: no val_fwd improvement for "
-                  f"{early_stop_patience} epochs (best={best_val_fwd:.4f})")
+            print(f"Early stop at epoch {epoch}: no improvement for "
+                  f"{early_stop_patience} epochs (best val_fwd={best_val_fwd:.4f})")
             break
 
         if epoch % 20 == 0:

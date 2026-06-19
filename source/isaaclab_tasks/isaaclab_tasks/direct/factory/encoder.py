@@ -99,13 +99,13 @@ def _build_backbone(name: str):
 class VisualForceEncoder(nn.Module):
     """Frozen visuo-force encoder for RL inference.
 
-    No bottleneck — returns [v_t, f_t] concat (vis_dim + 64).
-    Δv, Δf are computed externally by the environment using ring buffers.
-    The same features received VICReg + dynamics gradients during pretrain.
+    Returns bottleneck(256D) from [v_t, Δf, prev_a, proprio].
+    Pretrained with dynamics + task progress + future self-prediction + VICReg.
     """
 
-    def __init__(self, backbone_name: str = "resnet18"):
+    def __init__(self, backbone_name: str = "resnet18", mono: bool = False):
         super().__init__()
+        self._mono = mono
         self._backbone, self._vis_dim, self._encode_frame_fn = \
             _build_backbone(backbone_name)
 
@@ -113,48 +113,89 @@ class VisualForceEncoder(nn.Module):
 
         self.proj_mlp = nn.Sequential(
             nn.Linear(D, D), nn.GELU(), nn.Linear(D, D))
-        self.fusion_mlp = nn.Sequential(
-            nn.Linear(2 * D, D), nn.GELU(), nn.Linear(D, D))
+        if not mono:
+            self.fusion_mlp = nn.Sequential(
+                nn.Linear(2 * D, D), nn.GELU(), nn.Linear(D, D))
+        else:
+            self.fusion_mlp = None
         self.force_mlp = nn.Sequential(
-            nn.LayerNorm(18), nn.Linear(18, 64), nn.GELU(), nn.Linear(64, 64))
+            nn.LayerNorm(18), nn.Linear(18, 128), nn.GELU(), nn.Linear(128, 64))
+        # Bottleneck: [v_t(vis_dim), Δv(vis_dim), Δf(64)] → 256D (motion-aware)
+        self.bottleneck = nn.Sequential(
+            nn.Linear(D * 2 + 64, 256), nn.GELU(), nn.Linear(256, 256))
+        # Task head: [bottleneck(256), proprio(20)] → held_pos_rel_fixed (3D, bypass)
+        self.head_task = nn.Sequential(
+            nn.Linear(256 + 20, 128), nn.GELU(), nn.Linear(128, 3))
+
+        # Task output normalization (loaded from pretrain checkpoint)
+        self.register_buffer("task_mean", torch.zeros(3))
+        self.register_buffer("task_std", torch.ones(3))
+
+        # Cache for visual delta (mimics pretrain Δv = v_t - v_{t-k})
+        self.register_buffer("_prev_v_t", None)  # (num_envs, vis_dim), set on first call
 
     @property
     def feature_dim(self) -> int:
-        """RL policy input dimension (= vis_dim + 64)."""
-        return self._vis_dim + 64
+        return 256
 
-    def encode_visual(self, img_left, img_right):
-        """img_left/right: (B, 3, H, W) single-frame, ImageNet-normalised."""
-        fl = self.proj_mlp(self._encode_frame_fn(img_left))
-        fr = self.proj_mlp(self._encode_frame_fn(img_right))
-        return self.fusion_mlp(torch.cat([fl, fr], dim=-1))   # (B, vis_dim)
+    def encode_visual(self, img_left, img_right=None):
+        """img_left: (B, 3, H, W) single-frame. img_right optional (stereo only)."""
+        x = img_left[:, -1, :, :, :] if img_left.dim() == 5 else img_left
+        fl = self.proj_mlp(self._encode_frame_fn(x))
+        if self.fusion_mlp is not None and img_right is not None:
+            xr = img_right[:, -1, :, :, :] if img_right.dim() == 5 else img_right
+            fr = self.proj_mlp(self._encode_frame_fn(xr))
+            return self.fusion_mlp(torch.cat([fl, fr], dim=-1))  # (B, vis_dim)
+        return fl  # mono: single-frame direct output
 
     def encode_force(self, ft):
         """ft: (B, 18) — 3-frame force history."""
         return self.force_mlp(ft)                              # (B, 64)
 
-    def forward_features(self, img_left, img_right, ft_3frame):
-        """Return [v_t, f_t] concat for RL (env computes Δ externally).
+    def forward_features(self, img_left, img_right, ft_3frame, ft_3frame_k,
+                          prev_action, proprio):
+        """Return (bottleneck(256D), task_pred(3D)) for RL policy."""
+        v_t = self.encode_visual(img_left, img_right)
+        f_t = self.encode_force(ft_3frame)
+        f_tk = self.encode_force(ft_3frame_k)
+        Δf = f_t - f_tk
 
-        Returns:
-            (B, vis_dim + 64) features — same ones that received
-            VICReg + dynamics gradients during pretrain.
-        """
-        v = self.encode_visual(img_left, img_right)
-        f = self.encode_force(ft_3frame)
-        return torch.cat([v, f], dim=-1)                       # (B, vis_dim + 64)
+        # Visual delta (cached previous v_t, like pretrain Δv = v_t - v_{t-k})
+        if self._prev_v_t is None:
+            self._prev_v_t = v_t.detach()  # first call: init cache
+        Δv = v_t - self._prev_v_t
+        self._prev_v_t = v_t.detach()
+
+        z = self.bottleneck(torch.cat([v_t, Δv, Δf], dim=-1))
+        task_pred = self.head_task(torch.cat([z, proprio], dim=-1))  # (B, 3) normalized
+        task_pred = task_pred * self.task_std + self.task_mean        # de-normalize to meters
+        return z, task_pred
+
+    def predict_task(self, img_l, ft_3frame, img_r=None):
+        """Convenience wrapper for eval — matches eval_encoder_features call."""
+        B = img_l.shape[0] if img_l.dim() >= 3 else 1
+        dev = img_l.device
+        ft_3frame_k = torch.zeros_like(ft_3frame)
+        prev_action = torch.zeros(B, 6, device=dev)
+        proprio = torch.zeros(B, 20, device=dev)
+        _, task_pred = self.forward_features(img_l, img_r, ft_3frame, ft_3frame_k,
+                                              prev_action, proprio)
+        return task_pred
+
+    def reset_cache(self, env_ids=None):
+        """Reset cached visual features (call on env reset)."""
+        if self._prev_v_t is not None:
+            if env_ids is None:
+                self._prev_v_t.zero_()
+            else:
+                self._prev_v_t[env_ids] = 0.0
 
     @classmethod
     def from_checkpoint(cls, ckpt_path: str, backbone_name: str = "resnet18",
-                        device: str = "cuda:0"):
-        """Load frozen encoder from Stage E checkpoint.
-
-        Uses strict=False because pretrain checkpoint contains dynamics heads
-        (not needed for inference).
-        """
-        model = cls(backbone_name=backbone_name)
+                        device: str = "cuda:0", mono: bool = False):
+        model = cls(backbone_name=backbone_name, mono=mono)
         state = torch.load(ckpt_path, map_location=device)
-        model.load_state_dict(state, strict=False)
+        model.load_state_dict(state, strict=False)  # fusion_mlp keys skipped if mono
         model.to(device)
         model.eval()
         for p in model.parameters():

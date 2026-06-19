@@ -62,3 +62,8 @@ _build
 /.pretrained_checkpoints/
 
 IsaacSim-ros_workspaces
+
+# Dataset output
+**/data/**
+# Encoder output
+**/output/**

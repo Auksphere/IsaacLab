@@ -105,6 +105,10 @@ class RlGamesVecEnvWrapper(IVecEnv):
         self._clip_obs = clip_obs
         self._clip_actions = clip_actions
         self._sim_device = env.unwrapped.device
+        # BC residual: frozen BC LSTM policy for base action
+        self._bc_policy = None
+        self._cached_obs = None  # policy obs from previous step
+
         # information for privileged observations
         if self.state_space is None:
             self.rlg_num_states = 0
@@ -227,15 +231,28 @@ class RlGamesVecEnvWrapper(IVecEnv):
     Operations - MDP
     """
 
+    def set_bc_policy(self, bc_policy):
+        """Set frozen BC LSTM policy for residual RL: a_final = BC(obs) + RL(obs)."""
+        self._bc_policy = bc_policy
+        print(f"[BC-Residual] BC LSTM loaded, frozen. a_final = BC(obs) + RL(obs)")
+
     def seed(self, seed: int = -1) -> int:  # noqa: D102
         return self.unwrapped.seed(seed)
 
     def reset(self):  # noqa: D102
         obs_dict, _ = self.env.reset()
-        # process observations and states
-        return self._process_obs(obs_dict)
+        obs_and_states = self._process_obs(obs_dict)
+        if self._bc_policy is not None:
+            self._bc_policy.reset_hidden()
+            self._cached_obs = (obs_and_states["obs"].clone() if isinstance(obs_and_states, dict)
+                                else obs_and_states.clone())
+        return obs_and_states
 
     def step(self, actions):  # noqa: D102
+        # BC residual: a = RL_action + BC(cached_obs)
+        if self._cached_obs is not None and self._bc_policy is not None:
+            bc_actions = self._bc_policy(self._cached_obs)
+            actions = actions + bc_actions.to(actions.device)
         # move actions to sim-device
         actions = actions.detach().clone().to(device=self._sim_device)
         # clip the actions
@@ -260,6 +277,11 @@ class RlGamesVecEnvWrapper(IVecEnv):
         # remap extras from "log" to "episode"
         if "log" in extras:
             extras["episode"] = extras.pop("log")
+
+        # cache policy obs for next BC residual step
+        if self._bc_policy is not None:
+            self._cached_obs = (obs_and_states["obs"].clone() if isinstance(obs_and_states, dict)
+                                else obs_and_states.clone())
 
         return obs_and_states, rew, dones, extras
 

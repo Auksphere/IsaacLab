@@ -1,0 +1,80 @@
+{
+  "algo_name": "bc",
+  "experiment": {
+    "name": "peg_insert_bc",
+    "logging": {
+      "log_tb": true,
+      "terminal_output_to_txt": false
+    },
+    "save": {
+      "enabled": true,
+      "every_n_epochs": 50,
+      "epochs": [],
+      "on_best_validation": true,
+      "on_best_rollout_return": false,
+      "on_best_rollout_success_rate": true
+    },
+    "rollout": {
+      "enabled": false
+    }
+  },
+  "observation": {
+    "modalities": {
+      "obs": {
+        "low_dim": ["flat_obs"],
+        "rgb": []
+      }
+    }
+  },
+  "train": {
+    "data": "",
+    "output_dir": "../logs/robomimic",
+    "batch_size": 100,
+    "num_epochs": 1000,
+    "seed": 42,
+    "seq_length": 10,
+    "hdf5_normalize_obs": true,
+    "hdf5_filter_key": null,
+    "num_data_workers": 0
+  },
+  "algo": {
+    "optim_params": {
+      "policy": {
+        "optimizer_type": "adam",
+        "learning_rate": {
+          "initial": 0.001,
+          "decay_factor": 0.1,
+          "epoch_schedule": [],
+          "scheduler_type": "multistep"
+        },
+        "regularization": {
+          "L2": 0.0
+        }
+      }
+    },
+    "actor_layer_dims": [512, 128, 64],
+    "gmm": {
+      "enabled": false,
+      "num_modes": 5,
+      "min_std": 0.0001,
+      "std_activation": "softplus",
+      "low_noise_eval": true
+    },
+    "rnn": {
+      "enabled": true,
+      "rnn_type": "LSTM",
+      "num_layers": 2,
+      "hidden_dim": 1024,
+      "horizon": 200,
+      "open_loop": false,
+      "kwargs": {
+        "bidirectional": false
+      }
+    },
+    "loss": {
+      "l2_weight": 1.0,
+      "l1_weight": 0.0,
+      "cos_weight": 0.0
+    }
+  }
+}

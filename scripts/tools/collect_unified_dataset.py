@@ -13,6 +13,8 @@ from pathlib import Path
 from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description="Collect unified dataset (Stage D).")
+parser.add_argument("--task", type=str, default="",
+                    help="Task name (e.g. Isaac-Factory-PegInsert-Encoder-Direct-v0)")
 parser.add_argument("--config", type=str,
                     default=str(Path(__file__).resolve().parent / "collect_dataset.yaml"),
                     help="YAML config file (default: collect_dataset.yaml next to this script).")
@@ -38,19 +40,18 @@ from rl_games.common.algo_observer import IsaacAlgoObserver
 from rl_games.torch_runner import Runner
 from isaaclab_rl.rl_games import RlGamesVecEnvWrapper
 from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
-from isaaclab_tasks.direct.factory.factory_env_cfg import (
-    FactoryTaskPegInsertCfg,
-)
-
 N = cfg_yaml["num_envs"]
 
 # ── Create env ──
-print(f"[INFO] Creating vision env ({N} envs, base obs_order for ckpt compat)...")
-cfg = parse_env_cfg("Isaac-Factory-PegInsert-Vision-Direct-v0", device="cuda:0", num_envs=N)
-base_cfg = FactoryTaskPegInsertCfg()
-cfg.obs_order = list(base_cfg.obs_order)
-cfg.state_order = list(base_cfg.state_order)
-cfg.seed = cfg_yaml["splits"][0]["seed"]  # initial seed; per-split overrides later
+# Encoder debug mode: actor=critic=privileged state (43D) → matches sanity_check ckpt.
+# encoder_debug_keep_cameras=True → keep cameras for image collection.
+task_name = args_cli.task or cfg_yaml.get("task", "Isaac-Factory-PegInsert-Encoder-Direct-v0")
+print(f"[INFO] Creating encoder debug env ({N} envs, 43D privileged obs, cameras ON) task={task_name}...")
+cfg = parse_env_cfg(task_name, device="cuda:0", num_envs=N)
+cfg.encoder_debug_state_policy = True
+cfg.encoder_debug_keep_cameras = True   # keep cameras for image collection
+cfg.encoder_checkpoint = ""             # don't load encoder
+cfg.seed = cfg_yaml["splits"][0]["seed"]
 
 res = cfg_yaml.get("camera_resolution", 224)
 if res != 224:
@@ -60,7 +61,7 @@ if res != 224:
     cfg.tiled_camera_right.height = res
     print(f"[INFO] Camera resolution: {res}×{res}")
 
-env = gym.make("Isaac-Factory-PegInsert-Vision-Direct-v0", cfg=cfg)
+env = gym.make(task_name, cfg=cfg)
 
 # ── Load checkpoint ──
 ckpt = cfg_yaml["checkpoint"]
@@ -158,6 +159,9 @@ def collect_split(sc):
 
     # Initial reset
     obs_dict, _ = env.reset()
+    # Warmup: one no-op step to ensure cameras render
+    zero_action = torch.zeros(N, env.action_space.shape[-1], device="cuda:0")
+    obs_dict, _, _, _, _ = env.step(zero_action)
     for i in range(N):
         ep_ids[i] = next_ep_id; next_ep_id += 1
     player.reset()
@@ -171,6 +175,10 @@ def collect_split(sc):
         with torch.inference_mode():
             obs_rl = player.obs_to_torch(obs_tensor)
             actions = player.get_action(obs_rl, is_deterministic=True)
+        # Add noise for diverse data collection
+        action_noise = cfg_yaml.get("action_noise", 0.0)
+        if action_noise > 0:
+            actions = actions + torch.randn_like(actions) * action_noise
         t1 = time.perf_counter()
 
         obs_dict, rews, terms, truncs, infos = env.step(actions)
@@ -216,6 +224,9 @@ def collect_split(sc):
                 "contact_force_state": env_.contact_force_state[i].tolist(),
                 "engagement_state": float(env_.engagement_state[i, 0].item()),
                 "keypoint_dist": float(env_.keypoint_dist[i].item()),
+                "held_pos": env_.held_pos[i].tolist(),
+                "fixed_pos": env_.fixed_pos[i].tolist(),
+                "held_pos_rel_fixed": (env_.held_pos[i] - env_.fixed_pos_obs_frame[i]).tolist(),
                 "action": actions[i].tolist(),
                 "is_terminal": bool(terms[i] or truncs[i]),
                 "reward": float(rews[i].item()),

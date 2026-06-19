@@ -5,6 +5,10 @@
 #   Critic = privileged state (43D) — ignored with separate:False
 #   Symmetric AC (shared LSTM) — same config that passed debug verification.
 
+# ./isaaclab.sh -p scripts/reinforcement_learning/rl_games/train.py \
+#   --task Isaac-Factory-PegInsert-Encoder-Direct-v0 \
+#   --num_envs 128 --headless --enable_cameras --max_iterations 500
+
 params:
   seed: 0
   algo:
@@ -18,7 +22,7 @@ params:
 
   network:
     name: actor_critic
-    separate: True   # DEBUG: symmetric AC (change to True for encoder features)
+    separate: True
 
     space:
       continuous:
@@ -54,8 +58,11 @@ params:
   config:
     name: Factory
     device: cuda:0
-    full_experiment_name: dinov2_1
+    full_experiment_name: dinov2_13
     env_name: rlgpu
+    # Ablation: set encoder_ablate_bottleneck=True in factory_env_cfg.FactoryTaskPegInsertEncoderCfg
+    # to test whether bottleneck features are necessary (policy = 27D, no encoder).
+    ablate_bottleneck: false
     multi_gpu: False
     ppo: True
     mixed_precision: True
@@ -68,7 +75,7 @@ params:
     normalize_advantage: True
     gamma: 0.995
     tau: 0.95
-    learning_rate: 5.0e-5
+    learning_rate: 3.0e-4
     lr_schedule: adaptive
     schedule_type: standard
     kl_threshold: 0.008
@@ -77,16 +84,20 @@ params:
     save_best_after: 10
     save_frequency: 100
     print_stats: True
+    # LfD demo mixing: inject expert trajectories into PPO buffer
+    demo_data_path: "/workspace/isaaclab/output/bc_train.hdf5"
+    demo_mix_ratio: 0.50
+    demo_trajectories_per_iter: 64
     grad_norm: 1.0
-    entropy_coef: 0.0005
+    entropy_coef: 0.00
     truncate_grads: True
     e_clip: 0.2
-    horizon_length: 128
-    minibatch_size: 1024
+    horizon_length: 64
+    minibatch_size: 512
     mini_epochs: 4
     critic_coef: 2
     clip_value: True
-    seq_length: 128
+    seq_length: 64
     bounds_loss_coef: 0.0001
 
     central_value_config:

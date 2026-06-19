@@ -1,3 +1,14 @@
+# Stage F — RL Finetune with Frozen Encoder
+#
+# encoder_debug_state_policy=False (production mode):
+#   Policy = bottleneck(256D) + proprio(20D) + prev_action(6D) = 282D
+#   Critic = privileged state (43D) — ignored with separate:False
+#   Symmetric AC (shared LSTM) — same config that passed debug verification.
+
+# ./isaaclab.sh -p scripts/reinforcement_learning/rl_games/train.py \
+#   --task Isaac-Factory-PegInsert-Encoder-Direct-v0 \
+#   --num_envs 128 --headless --enable_cameras --max_iterations 500
+
 params:
   seed: 0
   algo:
@@ -11,7 +22,7 @@ params:
 
   network:
     name: actor_critic
-    separate: False
+    separate: True   # DEBUG: symmetric AC (change to True for encoder features)
 
     space:
       continuous:
@@ -47,7 +58,7 @@ params:
   config:
     name: Factory
     device: cuda:0
-    full_experiment_name: sanity_check_gearmesh
+    full_experiment_name: dinov2_ablation
     env_name: rlgpu
     multi_gpu: False
     ppo: True
@@ -61,21 +72,21 @@ params:
     normalize_advantage: True
     gamma: 0.995
     tau: 0.95
-    learning_rate: 1.0e-4
+    learning_rate: 1.0e-5
     lr_schedule: adaptive
     schedule_type: standard
     kl_threshold: 0.008
     score_to_win: 20000
-    max_epochs: 200
+    max_epochs: 500
     save_best_after: 10
     save_frequency: 100
     print_stats: True
     grad_norm: 1.0
-    entropy_coef: 0.0  # 0.0001  # 0.0
+    entropy_coef: 0.0005
     truncate_grads: True
     e_clip: 0.2
     horizon_length: 128
-    minibatch_size: 512  # batch size = num_envs * horizon_length; minibatch_size = batch_size / num_minibatches
+    minibatch_size: 1024
     mini_epochs: 4
     critic_coef: 2
     clip_value: True
