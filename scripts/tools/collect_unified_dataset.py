@@ -18,6 +18,8 @@ parser.add_argument("--task", type=str, default="",
 parser.add_argument("--config", type=str,
                     default=str(Path(__file__).resolve().parent / "collect_dataset.yaml"),
                     help="YAML config file (default: collect_dataset.yaml next to this script).")
+parser.add_argument("--obs-mode", type=str, default="dir_eng",
+                    help="Actor obs mode: 'pos' or 'dir_eng' (default: dir_eng).")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -51,11 +53,10 @@ N = cfg_yaml["num_envs"]
 # Encoder debug mode: actor=critic=privileged state (43D) → matches sanity_check ckpt.
 # encoder_debug_keep_cameras=True → keep cameras for image collection.
 task_name = args_cli.task or cfg_yaml.get("task", "Isaac-Factory-PegInsert-Encoder-Direct-v0")
-print(f"[INFO] Creating encoder debug env ({N} envs, 43D privileged obs, cameras ON) task={task_name}...")
+print(f"[INFO] Creating env ({N} envs, obs={args_cli.obs_mode}, cameras ON) task={task_name}...")
 cfg = parse_env_cfg(task_name, device="cuda:0", num_envs=N)
-cfg.encoder_debug_state_policy = True
-cfg.encoder_debug_keep_cameras = True   # keep cameras for image collection
-cfg.encoder_checkpoint = ""             # don't load encoder
+cfg.actor_obs_mode = args_cli.obs_mode or cfg_yaml.get("actor_obs_mode", "dir_eng")
+cfg.encoder_checkpoint = ""                    # don't load encoder
 cfg.seed = cfg_yaml["splits"][0]["seed"]
 
 res = cfg_yaml.get("camera_resolution", 224)

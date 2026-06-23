@@ -37,6 +37,15 @@ class FactoryEnv(DirectRLEnv):
         obs_dim_cfg = {**OBS_DIM_CFG, **FORCE_DIM_CFG, **CONTACT_DIM_CFG}
         state_dim_cfg = {**STATE_DIM_CFG, **FORCE_DIM_CFG, **CONTACT_DIM_CFG}
 
+        # Dynamic obs_order from actor_obs_mode flag
+        actor_mode = getattr(cfg, "actor_obs_mode", "pos")
+        if actor_mode == "dir_eng":
+            cfg.obs_order = ["fingertip_dir_xy", "engagement_state",
+                             "fingertip_quat", "ee_linvel", "ee_angvel"]
+        else:  # "pos"
+            cfg.obs_order = ["fingertip_pos_rel_fixed", "fingertip_quat",
+                             "ee_linvel", "ee_angvel"]
+
         cfg.observation_space = sum([obs_dim_cfg[obs] for obs in cfg.obs_order])
         cfg.state_space = sum([state_dim_cfg[state] for state in cfg.state_order])
         cfg.observation_space += cfg.action_space
@@ -46,8 +55,9 @@ class FactoryEnv(DirectRLEnv):
         encoder_ckpt = getattr(cfg, "encoder_checkpoint", "")
         self._encoder_debug_state_policy = getattr(cfg, "encoder_debug_state_policy", False)
         self._encoder_ablate_bottleneck = getattr(cfg, "encoder_ablate_bottleneck", False)
-        print(f"[INIT] encoder_debug_state_policy={self._encoder_debug_state_policy} (FORCED) "
-              f"ablate_bottleneck={self._encoder_ablate_bottleneck} "
+        print(f"[INIT] obs_mode={actor_mode} "
+              f"debug_state={self._encoder_debug_state_policy} "
+              f"ablate={self._encoder_ablate_bottleneck} "
               f"encoder_ckpt={repr(encoder_ckpt)}")
         self._curriculum_pos_alpha = 0.0
         self._curriculum_pos_alpha_delay = 0

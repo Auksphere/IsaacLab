@@ -160,7 +160,7 @@ class FactoryEnvCfg(DirectRLEnvCfg):
     # num_*: will be overwritten to correspond to obs_order, state_order.
     observation_space = 21
     state_space = 72
-    obs_order: list = ["fingertip_dir_xy", "engagement_state", "fingertip_quat", "ee_linvel", "ee_angvel"]  # SANITY: 19D, XY dir+eng
+    actor_obs_mode: str = "dir_eng"  # "pos" = 3D position, "dir_eng" = XY dir + engagement
     state_order: list = [
         "fingertip_pos",
         "fingertip_quat",
@@ -364,11 +364,6 @@ class FactoryTaskPegInsertVisionCfg(FactoryTaskPegInsertCfg):
     contact_sensor_fingertip: ContactSensorCfg | None = None
     contact_sensor_held_asset: ContactSensorCfg | None = None
 
-    # Policy obs: encoder mode adds bottleneck; debug mode uses privileged state.
-    obs_order: list = [
-        "fingertip_pos_rel_fixed", "fingertip_quat", "ee_linvel", "ee_angvel",
-    ]
-
     # Critic state: matches sanity_check checkpoint (43D = 37 + 6 actions).
     state_order: list = [
         "fingertip_pos", "fingertip_quat", "ee_linvel", "ee_angvel",
@@ -433,10 +428,7 @@ class FactoryTaskGearMeshEncoderCfg(FactoryTaskGearMeshCfg):
     contact_sensor_fingertip: ContactSensorCfg | None = None
     contact_sensor_held_asset: ContactSensorCfg | None = None
 
-    # ── Obs/State orders (same as peg insert vision) ──
-    obs_order: list = [
-        "fingertip_pos_rel_fixed", "fingertip_quat", "ee_linvel", "ee_angvel",
-    ]
+    # ── State order (obs_order inherited from base, matches sanity check) ──
     state_order: list = [
         "fingertip_pos", "fingertip_quat", "ee_linvel", "ee_angvel",
         "joint_pos", "held_pos", "held_pos_rel_fixed", "held_quat",

@@ -10,6 +10,10 @@
 # Overridable via --task CLI arg
 task: Isaac-Factory-PegInsert-Encoder-Direct-v0
 
+# ── Actor Obs Mode ────────────────────────────────────────────────────────────
+# "pos" = fingertip_pos_rel_fixed(3), "dir_eng" = XY dir(2) + engagement(1)
+actor_obs_mode: dir_eng
+
 # ── Output ──────────────────────────────────────────────────────────────────
 # Splits are placed directly under this directory:
 #   <output_dir>/train/   <output_dir>/val/   <output_dir>/test/
