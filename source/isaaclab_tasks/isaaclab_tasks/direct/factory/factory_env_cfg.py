@@ -103,8 +103,8 @@ class DomainRandCfg:
     joint_stiffness_scale: list = [0.9, 1.1]       # multiplier on default kp
 
     # ── Physics: peg/hole clearance ──
-    peg_scale: list = [0.97, 1.01]                 # uniform scale on peg mesh
-    hole_scale: list = [0.99, 1.03]                # uniform scale on hole fixture
+    peg_scale: list = [0.98, 1.02]                 # uniform scale on peg mesh
+    hole_scale: list = [0.98, 1.02]                # uniform scale on hole fixture
 
     # ── Visual: material appearance ──
     peg_hue_shift: list = [0.0, 0.0]               # hue rotation in degrees (0-360)
@@ -160,7 +160,7 @@ class FactoryEnvCfg(DirectRLEnvCfg):
     # num_*: will be overwritten to correspond to obs_order, state_order.
     observation_space = 21
     state_space = 72
-    actor_obs_mode: str = "dir_eng"  # "pos" = 3D position, "dir_eng" = XY dir + engagement
+    actor_obs_mode: str = "dir_eng"  # "pos" = 3D position, "dir_eng" = XY dir + engagement state
     state_order: list = [
         "fingertip_pos",
         "fingertip_quat",

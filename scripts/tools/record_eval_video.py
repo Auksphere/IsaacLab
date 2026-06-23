@@ -12,7 +12,7 @@ Usage (inside container):
   ./isaaclab.sh -p scripts/tools/record_eval_video.py \
     --ckpt /workspace/isaaclab/logs/rl_games/Factory/.../nn/last_Factory_*.pth \
     --encoder-ckpt /workspace/isaaclab/output/pretrain/pretrained_encoder_best.pt \
-    --episodes 5 --output-dir /workspace/isaaclab/output/videos
+    --episodes 5 --output-dir /workspace/isaaclab/output/videos --no-rand
 
   # Sanity check (no encoder, privileged-state policy):
   ./isaaclab.sh -p scripts/tools/record_eval_video.py \
@@ -43,6 +43,8 @@ parser.add_argument("--fps", type=int, default=15,
                     help="Video frame rate (default: 15).")
 parser.add_argument("--no-video", action="store_true",
                     help="Save PNG frames only, skip MP4 compilation.")
+parser.add_argument("--no-rand", action="store_true",
+                    help="Disable domain randomization for deterministic eval.")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 
@@ -89,6 +91,24 @@ else:
     cfg.encoder_debug_keep_cameras = True
 
 cfg.seed = 42
+cfg.episode_length_s = 15.0  # eval only: more time for 16mm insertion
+if args_cli.no_rand:
+    # Disable all domain randomization
+    dr = cfg.domain_rand
+    dr.material_full_replace = True
+    dr.dome_light_intensity = [1.0, 1.0]
+    dr.key_light_intensity = [1.0, 1.0]
+    dr.camera_pos_noise = [0.0, 0.0, 0.0]
+    dr.camera_target_noise = [0.0, 0.0, 0.0]
+    dr.held_mass_scale = [1.0, 1.0]
+    dr.fixed_mass_scale = [1.0, 1.0]
+    dr.held_friction = [1.0, 1.0]
+    dr.fixed_friction = [1.0, 1.0]
+    dr.joint_damping_scale = [1.0, 1.0]
+    dr.joint_stiffness_scale = [1.0, 1.0]
+    dr.peg_scale = [1.0, 1.0]
+    dr.hole_scale = [1.0, 1.0]
+    print("[INFO] Domain randomization DISABLED")
 env = gym.make("Isaac-Factory-PegInsert-Encoder-Direct-v0", cfg=cfg)
 env_ = env.unwrapped  # direct access to FactoryEnv internals
 
@@ -193,6 +213,12 @@ ckpt_stem = Path(args_cli.ckpt).stem[:40]
 
 for ep in range(args_cli.episodes):
     print(f"\n{'='*50}\nEpisode {ep}/{args_cli.episodes}")
+    # Per-episode log file (same name as video)
+    ep_log_path = output_dir / f"ep_{ep:03d}_{ckpt_stem}.txt"
+    ep_log = open(ep_log_path, "w")
+    ep_log.write(f"# Episode {ep}\n")
+    ep_log.write(f"# step kd rew cos eng_pred eng_gt dir_pred_x dir_pred_y dir_gt_x dir_gt_y\n")
+
     obs_dict, _ = env.reset()
     player.reset()
     _ = player.get_batch_size(obs_dict["policy"], N)
@@ -258,14 +284,20 @@ for ep in range(args_cli.episodes):
         ep_reward += float(rews[0].item())
         ep_min_kd = min(ep_min_kd, kd)
 
-        if step <= 10 or step % 25 == 0:
+        eng_gt_val = env_.engagement_state[0].item()
+        if True:  # every step
             print(f"  step={step:3d} kd={kd:.4f} rew={rews[0].item():.3f} "
                   f"xy=({dp[0]:.2f},{dp[1]:.2f}) cos={cos_sim:.3f} "
-                  f"eng={eng_np:.2f}/{env_.engagement_state[0].item():.0f}")
+                  f"eng={eng_np:.2f}/{eng_gt_val:.0f}")
+            ep_log.write(f"{step} {kd:.4f} {rews[0].item():.3f} {cos_sim:.3f} "
+                         f"{eng_np:.2f} {eng_gt_val:.0f} "
+                         f"{dp[0]:.4f} {dp[1]:.4f} {dg[0]:.4f} {dg[1]:.4f}\n")
 
         done = terms.any() or truncs.any()
-        if done:
+        if done or ep_min_kd < 0.002:
             success = ep_min_kd < 0.002
+            if success:
+                print(f"  → success at step {step}!")
             break
 
     # ── Episode summary ──
@@ -284,6 +316,8 @@ for ep in range(args_cli.episodes):
     })
     print(f"Ep {ep:2d}: succ={success} min_kd={ep_min_kd:.4f} "
           f"cum_rew={ep_reward:.1f} cos={mean_cos:.3f}")
+    ep_log.write(f"# succ={success} min_kd={ep_min_kd:.4f} cum_rew={ep_reward:.1f} cos={mean_cos:.3f}\n")
+    ep_log.close()
 
     # ── Compile video ──
     if not args_cli.no_video and len(frames) > 0:

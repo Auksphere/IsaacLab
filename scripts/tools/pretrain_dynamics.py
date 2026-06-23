@@ -129,12 +129,8 @@ class StageEDataset(Dataset):
         fingertip_rel = torch.tensor(
             [(fingertip_pos_v[i] - held_pos_v[i] + held_rel_v[i]) * 1000 for i in range(3)],
             dtype=torch.float32)
-        # XY direction: engaged → (0,0); otherwise normalize([x, y])
-        engaged = float(ep[t].get("engagement_state", 0.0) > 0.5)
-        if engaged:
-            fingertip_dir_xy = torch.zeros(2)
-        else:
-            fingertip_dir_xy = fingertip_rel[:2] / (torch.norm(fingertip_rel[:2]) + 1e-8)
+        # XY direction: normalize([x, y]), skip Z (always ~downward)
+        fingertip_dir_xy = fingertip_rel[:2] / (torch.norm(fingertip_rel[:2]) + 1e-8)
 
         return {
             "img_left_t":   self._load_3frame_rgb(ep, t,   "camera_left"),
@@ -507,7 +503,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch,
         # ── Task: cosine loss on XY direction (engaged→(0,0), skip origin) ──
         task_pred_dir = F.normalize(out["task_pred"], dim=-1, eps=1e-8)  # (B,2)
         kd_xy = torch.norm(task_gt_pos[:, :2], dim=-1)
-        mask = (kd_xy > 1e-4) & (eng_gt < 0.5)  # skip origin + engaged (cosine undefined for (0,0))
+        mask = kd_xy > 0.0125  # skip samples where direction is noisy (kd < 12.5mm)
         cos_sim = torch.sum(task_pred_dir * task_gt_dir, dim=-1)
         L_task = (1.0 - cos_sim[mask]).mean() if mask.any() else torch.tensor(0.0, device=device)
         L_eng  = F.binary_cross_entropy(out["eng_pred"].squeeze(-1), eng_gt.float())
@@ -575,7 +571,7 @@ def validate(model, dataloader, device, dp_scale: torch.Tensor) -> Dict[str, flo
         # Task: cosine similarity on XY direction (skip engaged + origin)
         task_pred_dir = F.normalize(out["task_pred"], dim=-1, eps=1e-8)  # (B,2)
         kd_xy = torch.norm(task_gt_pos[:, :2], dim=-1)
-        mask_v = (kd_xy > 1e-4) & (eng_gt < 0.5)  # skip origin + engaged
+        mask_v = kd_xy > 0.0125
         if mask_v.any():
             cos_v = torch.sum(task_pred_dir[mask_v] * task_gt_dir[mask_v], dim=-1).mean()
             mets["task_cos"] += cos_v.item()

@@ -128,7 +128,7 @@ class PegInsert(FactoryTask):
         spawn=sim_utils.UsdFileCfg(
             usd_path=held_asset_cfg.usd_path,
             # scale=(2.0, 2.0, 1.2),  # 8mm → 16mm
-            scale=(1.0, 1.0, 1.0),
+            scale=(2.0, 2.0, 1.2),
             activate_contact_sensors=True,
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 disable_gravity=True,
@@ -163,7 +163,7 @@ class PegInsert(FactoryTask):
         prim_path="/World/envs/env_.*/FixedAsset",
         spawn=sim_utils.UsdFileCfg(
             usd_path=fixed_asset_cfg.usd_path,
-            scale=(1.0, 1.0, 1.0),  # 8mm → 16mm
+            scale=(2.0, 2.0, 1.2),  # 8mm → 16mm
             activate_contact_sensors=True,
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 disable_gravity=False,
