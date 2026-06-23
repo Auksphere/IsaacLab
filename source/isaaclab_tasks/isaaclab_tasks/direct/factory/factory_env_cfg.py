@@ -103,8 +103,8 @@ class DomainRandCfg:
     joint_stiffness_scale: list = [0.9, 1.1]       # multiplier on default kp
 
     # ── Physics: peg/hole clearance ──
-    peg_scale: list = [0.98, 1.00]                 # uniform scale on peg mesh
-    hole_scale: list = [1.00, 1.02]                # uniform scale on hole fixture
+    peg_scale: list = [0.97, 1.01]                 # uniform scale on peg mesh
+    hole_scale: list = [0.99, 1.03]                # uniform scale on hole fixture
 
     # ── Visual: material appearance ──
     peg_hue_shift: list = [0.0, 0.0]               # hue rotation in degrees (0-360)
