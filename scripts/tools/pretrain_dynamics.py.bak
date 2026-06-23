@@ -1,13 +1,25 @@
 #!/usr/bin/env python3
 """
-Stage E V3: Dual-pathway visuo-force pretraining with MAE masked reconstruction.
+Stage E: Pretrain symmetric visuo-force dynamics encoder.
 
-Pathway1 (Visual-Geometry): head_vis(v_t,alpha_v,p_t)->z_vis(128D), head_task(z_vis,a)->held_pos_rel_fixed
-Pathway2 (Force-Contact):   head_force(f_t,alpha_f,p_t)->z_force(128D), head_engagement(z_force)->eng
-Dynamics:  head_dyn(alpha_v,alpha_f,p_t)->p_{t+K} (forward), inverse->p_t
-MAE:       masked_encoder([z_vis,z_force,p_t], 50pct mask)->reconstruction
+Architecture (per pretrain.md):
+  Visual:  img_L(t) → DINOv2(frozen) → ProjMLP ──┐
+           img_R(t) → DINOv2(frozen) → ProjMLP ──┤
+                        └── FusionMLP → v_t (vis_dim)
+  Force:   F(t-9,...,t) → cat[60D] → LayerNorm → ForceMLP(60→128→64) → f_t (64D)
+  Deltas:  Δv = v_t − v_{t-K}, Δf = f_t − f_{t-K}
+  DiffExtract: α_v = DiffExtract_v(Δv) (32D), α_f = DiffExtract_f(Δf) (32D)
+  Dynamics: head_base(v_t,α_v,p_t) → Δp̂_base, z_vis(128D)
+            head_resid(f_t,α_f,p_t,Δp̂_base) → Δp̂_resid, z_force(32D)
+            Δp̂ = Δp̂_base + Δp̂_resid
+  Self-sup: head_force_recon(f_t,α_f) → Δf̂
+  Bottleneck: z = Linear(concat[z_vis, z_force]) → 256D
+  Task: head_task(z, p_t) → held_pos_rel_fixed (3D, normalized)
+  VICReg: on bottleneck from dual-augment pathway
 
-Loss: L_dyn = L_fwd + 0.3*L_inv, L_total = w_dyn*L_dyn + w_task*L_task + w_eng*L_eng + w_recon*L_recon
+Loss:
+  L_dynamics = L_base + L_dyn + L_inv_base + L_inv_dyn + 0.5*L_f_recon
+  L_total = w_dyn*L_dynamics + w_task*L_task + w_vicreg*L_vicreg
 """
 from __future__ import annotations
 
@@ -35,7 +47,6 @@ FT_DIM = 6          # force/torque per frame
 IMG_SIZE = 224
 K = 3               # frame-skip for Δp computation
 PROPRIO_DIM = 20    # qpos(7)+fingertip_pos(3)+fingertip_quat(4)+ee_linvel(3)+ee_angvel(3)
-D_MAX = 5.0             # mm — clip held_rel target; beyond this only direction matters
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD  = (0.229, 0.224, 0.225)
@@ -58,16 +69,15 @@ class StageEDataset(Dataset):
                 rec = json.loads(line)
                 episodes[rec["episode_id"]].append(rec)
 
-        min_len = 2 * K + FT_FRAMES  # need t-K and t+K windows
+        min_len = K + FT_FRAMES
         for ep_id, frames in episodes.items():
             if len(frames) < min_len:
                 continue
             for t in range(FT_FRAMES - 1, len(frames)):
                 t_k = t - K
-                t_fwd = t + K
-                if t_k < FT_FRAMES - 1 or t_fwd >= len(frames):
+                if t_k < FT_FRAMES - 1:
                     continue
-                self._samples.append({"ep_id": ep_id, "t": t, "t_k": t_k, "t_fwd": t_fwd})
+                self._samples.append({"ep_id": ep_id, "t": t, "t_k": t_k})
 
     def __len__(self) -> int:
         return len(self._samples)
@@ -122,15 +132,8 @@ class StageEDataset(Dataset):
         ep = self._episodes(ep_id)
         t, t_k = info["t"], info["t_k"]
 
-        # Compute fingertip_pos_rel_fixed (world-frame, mm)
-        fingertip_pos_v = [float(ep[t].get("fingertip_pos", [0.0,0.0,0.0])[i]) for i in range(3)]
-        held_pos_v = [float(ep[t].get("held_pos", [0.0,0.0,0.0])[i]) for i in range(3)]
-        held_rel_v = [float(ep[t].get("held_pos_rel_fixed", [0.0,0.0,0.0])[i]) for i in range(3)]
-        fingertip_rel = torch.tensor(
-            [(fingertip_pos_v[i] - held_pos_v[i] + held_rel_v[i]) * 1000 for i in range(3)],
-            dtype=torch.float32)
-        # XY direction: normalize([x, y]), skip Z (always ~downward)
-        fingertip_dir_xy = fingertip_rel[:2] / (torch.norm(fingertip_rel[:2]) + 1e-8)
+        held_rel = ep[t].get("held_pos_rel_fixed", [0.0, 0.0, 0.0])
+        held_rel = torch.tensor([float(v) * 1000 for v in held_rel[:3]], dtype=torch.float32)
 
         return {
             "img_left_t":   self._load_3frame_rgb(ep, t,   "camera_left"),
@@ -141,10 +144,8 @@ class StageEDataset(Dataset):
             "ft_tk":        self._load_window_ft(ep, t_k),
             "p_t":          self._load_proprio(ep, t),
             "p_tk":         self._load_proprio(ep, t_k),
-            "p_fwd":        self._load_proprio(ep, info["t_fwd"]),
             "a":            self._load_action(ep, max(0, t - 1)),
-            "fingertip_pos_rel_fixed": fingertip_rel,
-            "fingertip_dir_xy": fingertip_dir_xy,
+            "held_pos_rel_fixed": held_rel,
             "engagement":   torch.tensor(float(ep[t].get("engagement_state", 0.0) > 0.5)),
             "ep_id":        torch.tensor(info["ep_id"]),
             "t":            torch.tensor(t),
@@ -178,6 +179,57 @@ class StageEDataset(Dataset):
 # Force noise model
 # =============================================================================
 
+def add_force_noise(F_clean: torch.Tensor, sigma_drift: float,
+                    sigma_coupled: float, sigma_white: float) -> torch.Tensor:
+    B, T, D = F_clean.shape
+    dev = F_clean.device
+    drift  = torch.cumsum(torch.randn(B, T, D, device=dev) * sigma_drift, dim=1)
+    couple = torch.randn(B, T, D, device=dev) * sigma_coupled
+    white  = torch.randn(B, T, D, device=dev) * sigma_white
+    return F_clean + drift + couple + white
+
+
+def sim2real_visual_augment(imgs: torch.Tensor) -> torch.Tensor:
+    import torchvision.transforms.functional as VF
+    N = imgs.shape[0]
+    mean_t = torch.tensor(IMAGENET_MEAN, device=imgs.device).view(1, 3, 1, 1)
+    std_t  = torch.tensor(IMAGENET_STD,  device=imgs.device).view(1, 3, 1, 1)
+    x = imgs * std_t + mean_t
+    x = x.clamp(0, 1)
+    for i in range(N):
+        xi = x[i]
+        xi = VF.adjust_brightness(xi, float(0.8 + 0.4 * torch.rand(1).item()))
+        xi = VF.adjust_contrast(xi,   float(0.8 + 0.4 * torch.rand(1).item()))
+        xi = VF.adjust_saturation(xi, float(0.7 + 0.6 * torch.rand(1).item()))
+        if torch.rand(1).item() > 0.5:
+            xi = VF.gaussian_blur(xi, kernel_size=3)
+        if torch.rand(1).item() > 0.5:
+            xi = xi + torch.randn_like(xi) * 0.02
+        x[i] = xi.clamp(0, 1)
+    return (x - mean_t) / std_t
+
+
+# =============================================================================
+# VICReg loss
+# =============================================================================
+
+def vicreg_loss(Z1: torch.Tensor, Z2: torch.Tensor,
+                lambda_var: float = 1.0, lambda_cov: float = 1.0,
+                eps: float = 1e-4) -> Tuple[torch.Tensor, Dict[str, float]]:
+    B, D = Z1.shape
+    L_inv = F.mse_loss(Z1, Z2)
+    Z = torch.cat([Z1, Z2], dim=0)
+    std_Z = torch.sqrt(Z.var(dim=0) + eps)
+    L_var = torch.mean(F.relu(1.0 - std_Z))
+    Zc = Z - Z.mean(dim=0, keepdim=True)
+    cov = (Zc.T @ Zc) / (2 * B - 1)
+    off_diag = cov * (1.0 - torch.eye(D, device=Z.device, dtype=cov.dtype))
+    L_cov = (off_diag ** 2).sum() / D
+    total = L_inv + lambda_var * L_var + lambda_cov * L_cov
+    return total, {"inv": float(L_inv.item()), "var": float(L_var.item()),
+                   "cov": float(L_cov.item())}
+
+
 # =============================================================================
 # Backbone factory
 # =============================================================================
@@ -205,7 +257,7 @@ def _build_backbone(name: str, pretrained: bool, freeze: bool):
 
     if name.startswith("dinov2_"):
         import importlib as _il
-        variant = name.replace("dinov2_", "").replace("_patches", "").replace("_attn", "")
+        variant = name.replace("dinov2_", "")
         dim = {"vits14": 384, "vitb14": 768}[variant]
         hub_dir = os.path.expanduser("~/.cache/torch/hub/facebookresearch_dinov2_main")
         ckpt_path = os.path.expanduser(
@@ -217,61 +269,19 @@ def _build_backbone(name: str, pretrained: bool, freeze: bool):
         try:
             hub_module = _il.import_module("hubconf")
             model_fn = getattr(hub_module, f"dinov2_{variant}")
-            dino = model_fn(pretrained=False)
+            model = model_fn(pretrained=False)
             state_dict = torch.load(ckpt_path, map_location="cpu")
-            dino.load_state_dict(state_dict, strict=True)
+            model.load_state_dict(state_dict, strict=True)
         finally:
             sys.path = old_path
-
-        use_patches = name.endswith("_patches")
-        use_attn = name.endswith("_attn")
-
-        if use_attn:
-            # Learnable spatial attention over patch tokens
-            class PatchAttnEncoder(nn.Module):
-                def __init__(self, dino_model, dim):
-                    super().__init__()
-                    self.dino = dino_model
-                    self.attn = nn.Sequential(nn.Linear(dim, 128), nn.GELU(), nn.Linear(128, 1))
-                    for p in self.dino.parameters():
-                        p.requires_grad = False
-
-                def forward(self, x):
-                    with torch.no_grad():
-                        patches = self.dino.get_intermediate_layers(
-                            x, n=1, return_class_token=False)[0]  # (B, 256, D)
-                    w = F.softmax(self.attn(patches).squeeze(-1), dim=-1)  # (B, 256)
-                    return (patches * w.unsqueeze(-1)).sum(dim=1)  # (B, D)
-
-            model = PatchAttnEncoder(dino, dim)
-            dim_out = dim
-
-            def encode_fn(x):
-                return model(x)
-        elif use_patches:
-            # Mean pool over patch tokens
-            for p in dino.parameters():
+        if freeze:
+            for p in model.parameters():
                 p.requires_grad = False
-            model = dino
-            dim_out = dim
 
-            def encode_fn(x):
-                with torch.no_grad():
-                    out = model.get_intermediate_layers(x, n=1, return_class_token=False)
-                    return out[0].mean(dim=1)
-        else:
-            # CLS token
-            if freeze:
-                for p in dino.parameters():
-                    p.requires_grad = False
-            model = dino
-            dim_out = dim
-
-            def encode_fn(x):
-                with torch.no_grad():
-                    return model(x)
-
-        return model, dim_out, encode_fn
+        def encode_fn(x):
+            with torch.no_grad():
+                return model(x)
+        return model, dim, encode_fn
 
     raise ValueError(f"Unknown backbone: {name}")
 
@@ -322,30 +332,24 @@ class SymmetricDynamicsEncoder(nn.Module):
             nn.Linear(32, 32))
 
         # ── Pathway 1: Visual-Geometry ──
-        # v_t(D) + α_v(32) + p_t(20) → z_vis(128)
+        # v_t(D) + α_v(32) + p_t(20) → z_vis(128), Δp̂_base(20)
         self.head_vis_fc1 = nn.Linear(D + 32 + 20, 256)
         self.head_vis_fc2 = nn.Linear(256, 128)
+        self.head_vis_fc3 = nn.Linear(128, 20)           # Δp̂_base
         # task head: z_vis(128) + a(6) → held_pos_rel_fixed
         self.head_task = nn.Sequential(
-            nn.Linear(128 + 6, 128), nn.GELU(), nn.Linear(128, 2))  # XY direction only
+            nn.Linear(128 + 6, 128), nn.GELU(), nn.Linear(128, 3))
 
         # ── Pathway 2: Force-Contact ──
         # f_t(64) + α_f(32) + p_t(20) → z_force(128)
         self.head_force = nn.Sequential(
-            nn.Linear(64 + 32 + 20, 64), nn.GELU(), nn.Linear(64, 128))
-        # engagement: z_vis(128)+z_force(128) → eng_pred (visual + force)
+            nn.Linear(64 + 32 + 20, 128), nn.GELU(), nn.Linear(128, 128))
+        # force recon: f_t(64) + α_f(32) → Δf̂(64)
+        self.head_force_recon = nn.Sequential(
+            nn.Linear(64 + 32, 64), nn.GELU(), nn.Linear(64, 64))
+        # engagement: z_force(128) → eng_pred
         self.head_engagement = nn.Sequential(
-            nn.Linear(128 + 128, 32), nn.GELU(), nn.Linear(32, 1), nn.Sigmoid())
-
-        # ── Unified dynamics: α_v(32)+α_f(32)+p_t(20) → p_{t+K}(20) ──
-        self.head_dyn = nn.Sequential(
-            nn.Linear(84, 128), nn.GELU(), nn.Linear(128, 20))
-
-        # ── MAE-style masked latent autoencoder ──
-        # Concat [z_vis(128), z_force(128), p_t(20)] = 276D,
-        # randomly mask 50% dims, MLP reconstructs full vector from survivors.
-        self.masked_encoder = nn.Sequential(
-            nn.Linear(276, 256), nn.GELU(), nn.Linear(256, 276))
+            nn.Linear(128, 32), nn.GELU(), nn.Linear(32, 1), nn.Sigmoid())
 
     # ------------------------------------------------------------------
     # Encoding
@@ -373,7 +377,7 @@ class SymmetricDynamicsEncoder(nn.Module):
                          img_left_tk: torch.Tensor, img_right_tk: torch.Tensor,
                          ft_t: torch.Tensor, ft_tk: torch.Tensor,
                          a: torch.Tensor,
-                         p_t: torch.Tensor, p_tk: torch.Tensor, p_fwd: torch.Tensor,
+                         p_t: torch.Tensor, p_tk: torch.Tensor,
                          ) -> Dict[str, torch.Tensor]:
         B = img_left_t.shape[0]
 
@@ -390,40 +394,34 @@ class SymmetricDynamicsEncoder(nn.Module):
 
         # 3. Pathway 1: Visual-Geometry
         h_vis = F.gelu(self.head_vis_fc1(torch.cat([v_t, α_v, p_t], dim=-1)))
-        z_vis = F.gelu(self.head_vis_fc2(h_vis))                 # (B,128)
+        z_vis = self.head_vis_fc2(h_vis)                        # (B,128)
+        Δp_base = self.head_vis_fc3(F.gelu(z_vis))              # (B,20)
         task_pred = self.head_task(torch.cat([z_vis, a], dim=-1))  # (B,3)
 
         # 4. Pathway 2: Force-Contact
         h_force = F.gelu(self.head_force(torch.cat([f_t, α_f, p_t], dim=-1)))
         z_force = h_force                                        # (B,128)
-        eng_pred = self.head_engagement(torch.cat([z_vis, z_force], dim=-1))  # (B,1)
+        Δf_recon = self.head_force_recon(torch.cat([f_t, α_f], dim=-1))  # (B,64)
+        eng_pred = self.head_engagement(z_force)                 # (B,1)
 
-        # 5. MAE masked reconstruction: 50% dims masked, reconstruct all
-        feats = torch.cat([z_vis, z_force, p_t], dim=-1)          # (B, 276)
-        mask = (torch.rand(B, 276, device=z_vis.device) < 0.5)    # 50% mask
-        feats_masked = feats * (~mask)
-        feats_recon = self.masked_encoder(feats_masked)           # (B, 276)
-        z_vis_cross = feats_recon[:, :128]
-        z_force_cross = feats_recon[:, 128:256]
-
-        # 5. Unified dynamics (forward: p_t → p_{t+K}, inverse: p_{t+K} → p_t)
-        p_fwd = self.head_dyn(torch.cat([α_v, α_f, p_t], dim=-1))
+        # 5. Inverse dynamics (optional, same weights)
         α_v_inv = self.diff_extract_v(-Δv)
-        α_f_inv = self.diff_extract_f(-Δf)
-        p_inv = self.head_dyn(torch.cat([α_v_inv, α_f_inv, p_fwd], dim=-1))
+        h_vis_inv = F.gelu(self.head_vis_fc1(torch.cat([v_tk, α_v_inv, p_tk], dim=-1)))
+        z_vis_inv = self.head_vis_fc2(h_vis_inv)
+        Δp_inv = self.head_vis_fc3(F.gelu(z_vis_inv))
 
         return {
+            "Δp_base": Δp_base, "Δp_inv": Δp_inv,
             "z_vis": z_vis, "z_force": z_force,
             "task_pred": task_pred, "eng_pred": eng_pred,
-            "p_fwd": p_fwd, "p_inv": p_inv,
+            "Δf_recon": Δf_recon,
             "v_t": v_t, "v_tk": v_tk, "f_t": f_t, "f_tk": f_tk,
             "Δv": Δv, "Δf": Δf,
-            "z_vis_cross": z_vis_cross, "z_force_cross": z_force_cross, "feats_recon": feats_recon,
         }
 
     def get_inference_state_dict(self) -> Dict[str, torch.Tensor]:
         """Keep encoders + both pathways. Exclude dynamics/aux heads."""
-        exclude = ("head_dyn.",)
+        exclude = ("head_vis_fc3.", "head_force_recon.")
         return {k: v for k, v in self.state_dict().items()
                 if not any(k.startswith(p) for p in exclude)}
 
@@ -436,37 +434,16 @@ class SymmetricDynamicsEncoder(nn.Module):
 # Training
 # =============================================================================
 
-def sim2real_visual_augment(imgs: torch.Tensor) -> torch.Tensor:
-    """Per-image visual augmentation: brightness, contrast, saturation, blur, noise.
-    imgs: (N, 3, H, W) normalized by ImageNet stats. Returns same shape."""
-    import torchvision.transforms.functional as VF
-    mean_t = torch.tensor(IMAGENET_MEAN, device=imgs.device).view(1, 3, 1, 1)
-    std_t  = torch.tensor(IMAGENET_STD,  device=imgs.device).view(1, 3, 1, 1)
-    x = imgs * std_t + mean_t  # de-normalize
-    x = x.clamp(0, 1)
-    N = x.shape[0]
-    for i in range(N):
-        xi = x[i]
-        xi = VF.adjust_brightness(xi, float(0.75 + 0.50 * torch.rand(1).item()))
-        xi = VF.adjust_contrast(xi,   float(0.75 + 0.50 * torch.rand(1).item()))
-        xi = VF.adjust_saturation(xi, float(0.60 + 0.80 * torch.rand(1).item()))
-        if torch.rand(1).item() > 0.5:
-            xi = VF.gaussian_blur(xi, kernel_size=3)
-        if torch.rand(1).item() > 0.5:
-            xi = xi + torch.randn_like(xi) * 0.03
-        x[i] = xi.clamp(0, 1)
-    return (x - mean_t) / std_t
-
-
 def train_epoch(model, dataloader, optimizer, device, epoch,
                 dp_scale: torch.Tensor,
-                w_dynamics=1.0, w_task=1.0, w_eng=1.0, w_recon=0.1,
-                warmup_inv_cons=5,
+                w_dynamics=1.0, w_task=1.0, w_eng=1.0,
+                warmup_inv_cons=5, warmup_force_noise=10,
+                sigma_drift=0.05, sigma_coupled=0.1, sigma_white=0.1,
                 ) -> Dict[str, float]:
     model.train()
     mets = defaultdict(float)
     use_inv = epoch >= warmup_inv_cons
-    inv_r = 0.5 if use_inv else 0.0
+    inv_r = 0.3 if use_inv else 0.0
 
     pbar = tqdm(dataloader, desc=f"Epoch {epoch:3d}")
     for batch in pbar:
@@ -474,46 +451,33 @@ def train_epoch(model, dataloader, optimizer, device, epoch,
         ir_t  = batch["img_right_t"].to(device)
         il_tk = batch["img_left_tk"].to(device)
         ir_tk = batch["img_right_tk"].to(device)
-        # Visual augmentation (per-frame)
-        B_img, T_img = il_t.shape[0], il_t.shape[1]
-        il_t  = sim2real_visual_augment(il_t.reshape(-1, 3, IMG_SIZE, IMG_SIZE)).view(B_img, T_img, 3, IMG_SIZE, IMG_SIZE)
-        ir_t  = sim2real_visual_augment(ir_t.reshape(-1, 3, IMG_SIZE, IMG_SIZE)).view(B_img, T_img, 3, IMG_SIZE, IMG_SIZE)
-        il_tk = sim2real_visual_augment(il_tk.reshape(-1, 3, IMG_SIZE, IMG_SIZE)).view(B_img, T_img, 3, IMG_SIZE, IMG_SIZE)
-        ir_tk = sim2real_visual_augment(ir_tk.reshape(-1, 3, IMG_SIZE, IMG_SIZE)).view(B_img, T_img, 3, IMG_SIZE, IMG_SIZE)
         ft_t  = batch["ft_t"].to(device)
         ft_tk = batch["ft_tk"].to(device)
         p_t   = batch["p_t"].to(device)
         p_tk  = batch["p_tk"].to(device)
         a     = batch["a"].to(device)
-        task_gt_pos = batch["fingertip_pos_rel_fixed"].to(device)  # for kd mask only
-        task_gt_dir = batch["fingertip_dir_xy"].to(device)          # (B,2) XY unit direction
+        held_gt = batch["held_pos_rel_fixed"].to(device)
         eng_gt = batch["engagement"].to(device)
-        p_fwd = batch["p_fwd"].to(device)
         B = il_t.shape[0]
+
+        Δp_gt = (p_t - p_tk) / dp_scale
 
         # Forward
         out = model.forward_pretrain(il_t, ir_t, il_tk, ir_tk, ft_t, ft_tk,
-                                     a, p_t, p_tk, p_fwd)
+                                     a, p_t, p_tk)
 
-        # ── Dynamics: p_{t+K} forward, p_t inverse ──
-        L_fwd = F.smooth_l1_loss(out["p_fwd"] / dp_scale, p_fwd / dp_scale)
-        L_inv  = F.smooth_l1_loss(out["p_inv"] / dp_scale, p_t / dp_scale) if use_inv else torch.tensor(0.0, device=device)
-        L_dynamics = L_fwd + inv_r * L_inv
+        # ── Dynamics ──
+        L_base = F.smooth_l1_loss(out["Δp_base"] / dp_scale, Δp_gt)
+        L_inv  = F.smooth_l1_loss(out["Δp_inv"] / dp_scale, -Δp_gt) if use_inv else torch.tensor(0.0, device=device)
+        L_f_recon = F.smooth_l1_loss(out["Δf_recon"], out["Δf"])
+        L_dynamics = L_base + inv_r * L_inv + 0.5 * L_f_recon
 
-        # ── Task: cosine loss on XY direction (skip origin where kd≈0) ──
-        task_pred_dir = F.normalize(out["task_pred"], dim=-1, eps=1e-8)  # (B,2)
-        kd_xy = torch.norm(task_gt_pos[:, :2], dim=-1)  # XY distance
-        mask = kd_xy > 1e-4
-        cos_sim = torch.sum(task_pred_dir * task_gt_dir, dim=-1)
-        L_task = (1.0 - cos_sim[mask]).mean() if mask.any() else torch.tensor(0.0, device=device)
+        # ── Task ──
+        held_norm = (held_gt - model.task_mean) / model.task_std
+        L_task = F.mse_loss(out["task_pred"], held_norm)
         L_eng  = F.binary_cross_entropy(out["eng_pred"].squeeze(-1), eng_gt.float())
 
-        # ── MSDP denoising loss (masked dims only) ──
-        feats_gt = torch.cat([out["z_vis"].detach(), out["z_force"].detach(),
-                               p_t], dim=-1)
-        L_recon = F.mse_loss(out["feats_recon"], feats_gt)
-
-        loss = w_dynamics * L_dynamics + w_task * L_task + w_eng * L_eng + w_recon * L_recon
+        loss = w_dynamics * L_dynamics + w_task * L_task + w_eng * L_eng
 
         optimizer.zero_grad()
         loss.backward()
@@ -521,17 +485,22 @@ def train_epoch(model, dataloader, optimizer, device, epoch,
         optimizer.step()
 
         mets["total"] += loss.item()
-        mets["fwd"] += L_fwd.item()
-        mets["inv_dyn"] += L_inv.item()
+        mets["base"] += L_base.item()
+        mets["dyn"]  += L_dyn.item()
+        mets["inv_base"] += L_inv_base.item()
+        mets["inv_dyn"]  += L_inv_dyn.item()
+        mets["f_recon"]  += L_f_recon.item()
         mets["task"] += L_task.item()
         mets["eng"]  += L_eng.item()
         eng_acc = ((out["eng_pred"].squeeze(-1) > 0.5).float() == eng_gt.float()).float().mean()
         mets["eng_acc"] += eng_acc.item()
-        mets["recon"] += L_recon.item()
-        
+        mets["vic"]  += L_vic.item()
+        for k, v in vc.items():
+            mets[f"vic_{k}"] += v
 
-        pbar.set_postfix(L=f"{loss.item():.4f}", fwd=f"{L_fwd.item():.4f}",
-                         task=f"{L_task.item():.4f}", eng=f"{L_eng.item():.3f}")
+        pbar.set_postfix(L=f"{loss.item():.4f}", base=f"{L_base.item():.4f}",
+                         dyn=f"{L_dyn.item():.4f}", task=f"{L_task.item():.4f}",
+                         eng=f"{L_eng.item():.3f}")
 
     n = max(1, len(dataloader))
     return {k: v / n for k, v in mets.items()}
@@ -551,40 +520,40 @@ def validate(model, dataloader, device, dp_scale: torch.Tensor) -> Dict[str, flo
         p_t   = batch["p_t"].to(device)
         p_tk  = batch["p_tk"].to(device)
         a     = batch["a"].to(device)
-        task_gt_pos = batch["fingertip_pos_rel_fixed"].to(device)  # for kd mask
-        task_gt_dir = batch["fingertip_dir_xy"].to(device)          # (B,2)
+        held_gt = batch["held_pos_rel_fixed"].to(device)
         eng_gt = batch["engagement"].to(device)
-        p_fwd_gt = batch["p_fwd"].to(device)
 
         out = model.forward_pretrain(il_t, ir_t, il_tk, ir_tk, ft_t, ft_tk,
-                                     a, p_t, p_tk, p_fwd_gt)
+                                     a, p_t, p_tk)
 
+        Δp_gt = (p_t - p_tk) / dp_scale
         mets["fwd"] += F.smooth_l1_loss(
-            out["p_fwd"] / dp_scale, p_fwd_gt / dp_scale).item()
+            out["Δp_fwd"] / dp_scale, Δp_gt).item()
         mets["inv"] += F.smooth_l1_loss(
-            out["p_inv"] / dp_scale, p_t / dp_scale).item()
+            out["Δp_inv"] / dp_scale, -Δp_gt).item()
 
-        # MAE reconstruction (reuse forward pass output)
-        feats_v = torch.cat([out["z_vis"], out["z_force"], p_t], dim=-1)
-        L_recon = F.mse_loss(out["feats_recon"], feats_v)
-
-        # Task: cosine similarity on XY direction (skip origin)
-        task_pred_dir = F.normalize(out["task_pred"], dim=-1, eps=1e-8)  # (B,2)
-        kd_xy = torch.norm(task_gt_pos[:, :2], dim=-1)
-        mask_v = kd_xy > 1e-4
-        if mask_v.any():
-            cos_v = torch.sum(task_pred_dir[mask_v] * task_gt_dir[mask_v], dim=-1).mean()
-            mets["task_cos"] += cos_v.item()
+        # Task L2 error (mm, de-normalized)
+        task_pred_mm = out["task_pred"] * model.task_std + model.task_mean
+        mets["task_l2_mm"] += torch.sqrt(
+            F.mse_loss(task_pred_mm, held_gt)).item()
 
         # Engagement accuracy
         eng_acc = ((out["eng_pred"].squeeze(-1) > 0.5).float() == eng_gt.float()).float().mean()
         mets["eng_acc"] += eng_acc.item()
-        mets["recon"] += L_recon.item()
-        
 
     n = max(1, len(dataloader))
     return {k: v / n for k, v in mets.items()}
 
+
+def sigma_anneal(epoch: int, start: int, end: int, sigma_max: float) -> float:
+    if epoch < start: return 0.0
+    if epoch > end:   return sigma_max
+    return sigma_max * (epoch - start) / (end - start)
+
+
+# =============================================================================
+# Main
+# =============================================================================
 
 def main():
     parser = argparse.ArgumentParser(description="Stage E: pretrain dynamics encoder")
@@ -624,10 +593,16 @@ def main():
         lr=_get("lr", 1e-3),
         weight_decay=_get("weight_decay", 1e-4),
         w_dynamics=_get("w_dyn", 1.0),
+        w_vicreg=_get("w_vicreg", 0.3),
         w_task=_get("w_task", 1.0),
         w_eng=_get("w_eng", 1.0),
-        w_recon=_get("w_recon", 0.1),
+        sigma_end=_get("sigma_end", 2.0),
         warmup_inv_cons=_get("warmup_inv_cons", 5),
+        warmup_vicreg=_get("warmup_vicreg", 5),
+        warmup_force_noise=_get("warmup_force_noise", 10),
+        sigma_start=_get("sigma_start", 0.1),
+        sigma_start_epoch=_get("sigma_start_epoch", 10),
+        sigma_end_epoch=_get("sigma_end_epoch", 80),
         device=_get("device", "cuda"),
         num_workers=_get("num_workers", 4),
         seed=_get("seed", 42),
@@ -646,7 +621,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     import builtins
-    log_file = open(output_dir / "summary.txt", "w", buffering=1)
+    log_file = open(output_dir / "summary.txt", "a", buffering=1)
     _orig_print = builtins.print
     def _tee_print(*a, **kw):
         import io
@@ -662,13 +637,17 @@ def main():
     ds_val   = StageEDataset(data_dir / "val"   / "labels.jsonl", data_dir / "val"   / "images")
     print(f"Train: {len(ds_train)} samples, Val: {len(ds_val)} samples")
 
-    _dps = []
+    _dps, _held_rels = [], []
     for i in range(min(500, len(ds_train))):
         s = ds_train[i]
         _dps.append(s["p_t"] - s["p_tk"])
+        _held_rels.append(s["held_pos_rel_fixed"])
     dp_scale = torch.stack(_dps).std().to(device) + 1e-8
+    held_rel = torch.stack(_held_rels)
+    task_mean = held_rel.mean(dim=0).to(device)
+    task_std  = held_rel.std(dim=0).clamp(min=1e-4).to(device)
     print(f"Δp overall RMS: {dp_scale.item():.5f}")
-    print(f"Task head: direction (cosine loss, no norm stats needed)")
+    print(f"Task norm: mean={task_mean.tolist()} std={task_std.tolist()}")
 
     dl_train = DataLoader(ds_train, batch_size=args.batch_size, shuffle=True,
                           num_workers=args.num_workers, pin_memory=True, drop_last=True)
@@ -678,6 +657,8 @@ def main():
     model = SymmetricDynamicsEncoder(
         backbone_name=args.backbone, pretrained=args.pretrained_backbone,
         freeze_backbone=args.freeze_backbone, mono=args.mono).to(device)
+    model.task_mean.copy_(task_mean)
+    model.task_std.copy_(task_std)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Backbone: {args.backbone} ({model._vis_dim}D), trainable: {n_params:,} params")
 
@@ -692,43 +673,52 @@ def main():
     t0 = time.time()
 
     for epoch in range(1, args.epochs + 1):
+        s = sigma_anneal(epoch, args.sigma_start_epoch, args.sigma_end_epoch,
+                         args.sigma_end)
+
         train_m = train_epoch(
             model, dl_train, optimizer, device, epoch,
             w_dynamics=args.w_dynamics,
+            w_vicreg=args.w_vicreg if epoch >= args.warmup_vicreg else 0.0,
             w_task=args.w_task,
             w_eng=args.w_eng,
-            w_recon=args.w_recon,
             warmup_inv_cons=args.warmup_inv_cons,
+            warmup_vicreg=args.warmup_vicreg,
+            warmup_force_noise=args.warmup_force_noise,
+            sigma_drift=s, sigma_coupled=s, sigma_white=s,
             dp_scale=dp_scale,
         )
         val_m = validate(model, dl_val, device, dp_scale)
 
-        val_task_cos = val_m.get("task_cos", 0.0)
         val_combined = (args.w_dynamics * val_m["fwd"]
-                        + args.w_task * (1.0 - val_task_cos)
+                        + args.w_task * val_m.get("task_l2_mm", 0)
                         + args.w_eng * (1.0 - val_m.get("eng_acc", 0.5)))
         scheduler.step(val_combined)
         elapsed = time.time() - t0
 
         for k, v in {**train_m, **{f"val_{k2}": v2 for k2, v2 in val_m.items()}}.items():
             writer.add_scalar(k, v, epoch)
+        writer.add_scalar("sigma", s, epoch)
         writer.add_scalar("lr", optimizer.param_groups[0]["lr"], epoch)
 
         print(f"Epoch {epoch:3d} | Σ {train_m['total']:.4f} "
-              f"fwd={train_m['fwd']:.4f} inv={train_m['inv_dyn']:.4f} "
-              f"recon={train_m['recon']:.4f} "
+              f"base={train_m['base']:.4f} dyn={train_m['dyn']:.4f} "
               f"task={train_m['task']:.4f} eng={train_m['eng']:.4f}(acc={train_m['eng_acc']:.2f}) "
-              f"val_fwd={val_m['fwd']:.4f} val_cos={val_task_cos:.3f} "
-              f"lr={optimizer.param_groups[0]['lr']:.2e} {elapsed:.0f}s")
+              f"val_fwd={val_m['fwd']:.4f} val_task={val_m['task_l2_mm']:.2f}mm "
+              f""
+              f"vic=[i={train_m.get('vic_inv',0):.3f} v={train_m.get('vic_var',0):.3f} "
+              f"c={train_m.get('vic_cov',0):.3f}] "
+              f"σ={s:.1f} lr={optimizer.param_groups[0]['lr']:.2e} {elapsed:.0f}s")
 
         no_improve_count += 1
+        val_task = val_m.get("task_l2_mm", float("inf"))
         if val_combined < best_combined:
             best_combined = val_combined
             no_improve_count = 0
             torch.save(model.get_inference_state_dict(),
                        output_dir / "pretrained_encoder_best.pt")
             print(f"  → best (combined={val_combined:.4f} "
-                  f"fwd={val_m['fwd']:.4f} cos={val_task_cos:.3f} "
+                  f"fwd={val_m['fwd']:.4f} task_l2={val_task:.2f}mm "
                   f"eng_acc={val_m.get('eng_acc',0):.3f})")
         if early_stop_patience > 0 and no_improve_count >= early_stop_patience:
             print(f"Early stop at epoch {epoch}")

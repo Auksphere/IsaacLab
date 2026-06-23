@@ -14,7 +14,7 @@ from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--encoder-ckpt", type=str, default="")
-parser.add_argument("--backbone", type=str, default="dinov2_vits14")
+parser.add_argument("--backbone", type=str, default="dinov2_vits14_attn")
 parser.add_argument("--episodes", type=int, default=10)
 parser.add_argument("--max-steps", type=int, default=200)
 AppLauncher.add_app_launcher_args(parser)
@@ -59,6 +59,19 @@ if args_cli.encoder_ckpt and args_cli.encoder_ckpt != "":
     print(f"  feature_dim={encoder.feature_dim}")
 else:
     print("[INFO] No encoder — pure expert test mode")
+
+# Tee output to eval_log.txt in the checkpoint directory
+import builtins
+log_dir = Path(args_cli.encoder_ckpt).resolve().parent if args_cli.encoder_ckpt else Path(".")
+log_file = open(log_dir / "eval_log.txt", "a", buffering=1, encoding="utf-8")
+_orig_print = builtins.print
+def _tee_print(*a, **kw):
+    import io
+    _orig_print(*a, **kw)
+    buf = io.StringIO()
+    _orig_print(*a, file=buf, **kw)
+    log_file.write(buf.getvalue()); log_file.flush()
+builtins.print = _tee_print
 
 # ── Load expert policy (EXACT same as collect) ──
 ckpt_path = "/workspace/isaaclab/logs/rl_games/Factory/sanity_check/nn/last_Factory_ep_200_rew_389.05432.pth"
@@ -126,18 +139,24 @@ while global_ep < args_cli.episodes:
         env_ = env.unwrapped
         img_l = preprocess_rgb(env_._tiled_camera_left.data.output["rgb"])
         img_r = preprocess_rgb(env_._tiled_camera_right.data.output["rgb"])
-        ft_3f = env_.ft_ring[:, -3:, :].reshape(N, 18)
-        ft_3f_k = env_.ft_ring[:, :3, :].reshape(N, 18)
+        ft_3f = env_.ft_ring[:, -10:, :].reshape(N, 60)     # 10-frame window
+        ft_3f_k = env_.ft_ring[:, :10, :].reshape(N, 60)   # K steps ago
         proprio_20 = torch.cat([
             env_.joint_pos[:, 0:7], env_.fingertip_midpoint_pos,
             env_.fingertip_midpoint_quat, env_.ee_linvel_fd, env_.ee_angvel_fd,
         ], dim=-1)
         with torch.cuda.amp.autocast(enabled=True, dtype=torch.float16):
-            task_pred = encoder.predict_task(img_l, ft_3f, img_r=img_r)
-        task_np = task_pred.float().cpu().numpy().squeeze()
-        held_rel_np = (env_.held_pos[0] - env_.fixed_pos_obs_frame[0]).cpu().numpy() * 1000
-        ep_data["task_pred"].append(task_np)
-        ep_data["held_rel"].append(held_rel_np)
+            dir_pred, eng_pred = encoder.predict_task(img_l, ft_3f, img_r=img_r,
+                                                          prev_action=prev_action, proprio=proprio_20,
+                                                          ft_3frame_k=ft_3f_k)
+        dir_np = dir_pred.float().cpu().numpy().squeeze()
+        eng_np = eng_pred.float().cpu().item()
+        # Ground-truth XY direction (world frame XY, skip Z)
+        d_world = env_.fingertip_midpoint_pos[0, :2] - env_.fixed_pos_obs_frame[0, :2]
+        dir_gt_np = (d_world / (d_world.norm() + 1e-8)).cpu().numpy()
+        ep_data["dir_pred"].append(dir_np)
+        ep_data["dir_gt"].append(dir_gt_np)
+        ep_data["eng_pred"].append(eng_np)
 
     obs_dict, rews, terms, truncs, infos = env.step(actions)
     prev_action = actions.clone()
@@ -152,14 +171,15 @@ while global_ep < args_cli.episodes:
     ep_min_kd = min(ep_min_kd, _kd)
     step_n = ep_frames[0].item()
     if step_n <= 25 or step_n % 25 == 0:
-        tp = ep_data["task_pred"][-1] if ep_data["task_pred"] else [0,0,0]
-        hr = ep_data["held_rel"][-1] if ep_data["held_rel"] else [0,0,0]
-        err = [abs(tp[i]-hr[i]) for i in range(3)]
+        tp = ep_data["dir_pred"][-1] if ep_data["dir_pred"] else [0,0]
+        tg = ep_data["dir_gt"][-1] if ep_data["dir_gt"] else [0,0]
+        cos = float(np.dot(tp, tg))
+        eng = ep_data["eng_pred"][-1] if ep_data["eng_pred"] else 0.0
+        eng_gt = env_.engagement_state[0].item()
         print(f"  step={step_n:3d} kd={_kd:.4f} min_kd={ep_min_kd:.4f} "
               f"rew={rews[0].item():.3f} cum_rew={ep_rewards[0].item():.1f} "
-              f"| pred=({tp[0]:.1f}, {tp[1]:.1f}, {tp[2]:.1f}) "
-              f"gt=({hr[0]:.1f}, {hr[1]:.1f}, {hr[2]:.1f}) "
-              f"err=({err[0]:.1f}, {err[1]:.1f}, {err[2]:.1f}) mm")
+              f"| xy=({tp[0]:.2f},{tp[1]:.2f}) gt=({tg[0]:.2f},{tg[1]:.2f}) "
+              f"cos={cos:.3f} eng={eng:.2f}/{eng_gt:.0f}")
 
     obs_tensor = obs_dict["policy"]
 
@@ -173,38 +193,25 @@ while global_ep < args_cli.episodes:
             print(f"  EP DONE: succ={success} min_kd={ep_min_kd:.4f} cum_rew={ep_rewards[i].item():.1f}")
 
             # Compute metrics if encoder was used
-            if len(ep_data["task_pred"]) > 0:
-                task_arr = np.array(ep_data["task_pred"])
-                held_arr = np.array(ep_data["held_rel"])
-                errors = task_arr - held_arr
-                l2_mm = float(np.mean(np.linalg.norm(errors, axis=-1)))
-
-                cos_sims = []
-                for j in range(len(task_arr)):
-                    a, b = task_arr[j], held_arr[j]
-                    na, nb = np.linalg.norm(a), np.linalg.norm(b)
-                    if na > 1e-6 and nb > 1e-6:
-                        cos_sims.append(float(np.dot(a, b) / (na * nb)))
-                mean_cos = np.mean(cos_sims) if cos_sims else 0
-
-                per_dim = np.sqrt(np.mean(errors**2, axis=0))
-                frames = len(task_arr)
+            if len(ep_data["dir_pred"]) > 0:
+                dir_preds = np.array(ep_data["dir_pred"])
+                dir_gts = np.array(ep_data["dir_gt"])
+                cos_sims = [float(np.dot(dir_preds[j], dir_gts[j]))
+                            for j in range(len(dir_preds))]
+                mean_cos = float(np.mean(cos_sims)) if cos_sims else 0.0
+                frames = len(dir_preds)
             else:
-                l2_mm = mean_cos = 0
-                per_dim = np.zeros(3)
+                mean_cos = 0.0
                 frames = 0
 
             results.append({
                 "ep": global_ep, "frames": frames or ep_frames[i].item(),
                 "success": success, "min_kd": ep_min_kd,
-                "l2_mm": l2_mm, "cos_sim": mean_cos,
-                "dx_mm": float(per_dim[0]), "dy_mm": float(per_dim[1]),
-                "dz_mm": float(per_dim[2]),
+                "cos_sim": mean_cos,
             })
 
             print(f"Ep {global_ep:2d}: succ={success} min_kd={ep_min_kd:.4f} "
-                  f"L2={l2_mm:.1f}mm cos={mean_cos:.3f} "
-                  f"dx={per_dim[0]:.1f} dy={per_dim[1]:.1f} dz={per_dim[2]:.1f}")
+                  f"cos={mean_cos:.3f} frames={frames}")
 
             global_ep += 1
             if global_ep >= args_cli.episodes:
@@ -231,13 +238,10 @@ env.close()
 # ── Summary ──
 if len(results) > 0:
     succ_rate = sum(r["success"] for r in results) / len(results)
-    l2s = [r["l2_mm"] for r in results if r["l2_mm"] > 0]
-    coses = [r["cos_sim"] for r in results if r["cos_sim"] > 0]
+    coses = [r["cos_sim"] for r in results if r["cos_sim"] != 0]
     print(f"\n{'='*60}")
     print(f"Summary ({len(results)} episodes, {succ_rate*100:.0f}% success):")
-    if l2s:
-        print(f"  task_pred L2 error:        {np.mean(l2s):.1f} ± {np.std(l2s):.1f} mm")
     if coses:
-        print(f"  Cosine similarity:         {np.mean(coses):.3f} ± {np.std(coses):.3f}")
+        print(f"  Direction cosine:          {np.mean(coses):.3f} ± {np.std(coses):.3f}")
 
 simulation_app.close()

@@ -16,7 +16,7 @@ from .factory_env_cfg import (
     FactoryTaskPegInsertCfg,
     FactoryTaskPegInsertVisionCfg,
     FactoryTaskPegInsertEncoderCfg,
-    FactoryTaskPegInsertEncoderV7Cfg,
+    FactoryTaskPegInsertEncoderCfg,
     FactoryTaskPegInsertMonoEncoderCfg,
     FactoryTaskUSBInsertEncoderCfg,
 )
@@ -90,7 +90,7 @@ gym.register(
     entry_point="isaaclab_tasks.direct.factory:FactoryEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": FactoryTaskPegInsertEncoderV7Cfg,
+        "env_cfg_entry_point": FactoryTaskPegInsertEncoderCfg,
         "rl_games_cfg_entry_point": f"{agents.__name__}:rl_games_ppo_encoder_cfg.yaml",
         "robomimic_bc_cfg_entry_point": os.path.join(agents.__path__[0], "robomimic/bc.json"),
     },

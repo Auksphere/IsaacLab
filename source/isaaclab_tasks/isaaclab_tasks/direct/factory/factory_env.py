@@ -5,6 +5,7 @@
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 import carb
 import isaacsim.core.utils.torch as torch_utils
@@ -45,6 +46,9 @@ class FactoryEnv(DirectRLEnv):
         encoder_ckpt = getattr(cfg, "encoder_checkpoint", "")
         self._encoder_debug_state_policy = getattr(cfg, "encoder_debug_state_policy", False)
         self._encoder_ablate_bottleneck = getattr(cfg, "encoder_ablate_bottleneck", False)
+        print(f"[INIT] encoder_debug_state_policy={self._encoder_debug_state_policy} (FORCED) "
+              f"ablate_bottleneck={self._encoder_ablate_bottleneck} "
+              f"encoder_ckpt={repr(encoder_ckpt)}")
         self._curriculum_pos_alpha = 0.0
         self._curriculum_pos_alpha_delay = 0
         self._curriculum_pos_alpha_decay_steps = 0
@@ -98,10 +102,10 @@ class FactoryEnv(DirectRLEnv):
         self.contact_force_state = torch.zeros((self.num_envs, 4), device=self.device)
         self.engagement_state = torch.zeros((self.num_envs, 1), device=self.device)
 
-        # Raw force ring buffer: K+3 frames for Δf computation
-        # ft_ring[-3:] = current 3-frame, ft_ring[:3] = K steps ago
+        # Raw force ring buffer: K+10 frames
+        # ft_ring[-10:] = current 10-frame, ft_ring[:10] = K steps ago
         self.K = 3
-        self.ft_ring = torch.zeros((self.num_envs, self.K + 3, 6), device=self.device)
+        self.ft_ring = torch.zeros((self.num_envs, self.K + 10, 6), device=self.device)
 
         self._compute_intermediate_values(dt=self.physics_dt)
 
@@ -121,7 +125,6 @@ class FactoryEnv(DirectRLEnv):
                 and not self._encoder_ablate_bottleneck:
             backbone_name = getattr(cfg, "encoder_backbone", "resnet18")
             mono = getattr(cfg, "encoder_mono", False)
-            v7 = getattr(cfg, "encoder_v7", False)
             self._encoder = VisualForceEncoder.from_checkpoint(
                 str(encoder_ckpt), backbone_name=backbone_name, device=self.device,
                 mono=mono)
@@ -500,7 +503,7 @@ class FactoryEnv(DirectRLEnv):
         self._tiled_camera_right.set_world_poses_from_view(eye2_world, tgt2_world)
 
     def _compute_encoder_features(self):
-        """Return (z_bottleneck(256D), task_pred(3D)) from pretrained encoder."""
+        """Return (z_vis(128D), z_force(128D)) from pretrained encoder."""
         if self._encoder is None or self._tiled_camera_left is None:
             return None
         from .encoder import preprocess_rgb
@@ -509,17 +512,17 @@ class FactoryEnv(DirectRLEnv):
         if self._tiled_camera_right is not None:
             img_r = preprocess_rgb(self._tiled_camera_right.data.output["rgb"])
 
-        ft_3f   = self.ft_ring[:, -3:, :].reshape(self.num_envs, 18)
-        ft_3f_k = self.ft_ring[:, :3, :].reshape(self.num_envs, 18)
+        ft_3f   = self.ft_ring[:, -10:, :].reshape(self.num_envs, 60)   # 10-frame
+        ft_3f_k = self.ft_ring[:, :10, :].reshape(self.num_envs, 60)    # K steps ago
         proprio_20 = torch.cat([
             self.joint_pos[:, 0:7], self.fingertip_midpoint_pos,
             self.fingertip_midpoint_quat, self.ee_linvel_fd, self.ee_angvel_fd,
         ], dim=-1)
 
-        with torch.cuda.amp.autocast(enabled=True, dtype=torch.float16):
-            z, task_pred = self._encoder.forward_features(
+        with torch.amp.autocast("cuda", enabled=True, dtype=torch.float16):
+            z_vis, z_force, _, _ = self._encoder.forward_features(
                 img_l, img_r, ft_3f, ft_3f_k, self.raw_actions, proprio_20)
-        return z.float(), task_pred.float()
+        return z_vis.float(), z_force.float()  # (N, 128) each
 
     def _get_observations(self):
         """Get actor/critic inputs.
@@ -538,6 +541,12 @@ class FactoryEnv(DirectRLEnv):
             "ee_angvel": self.ee_angvel_fd,
             "force_torque": self.force_torque,
             "contact_force_state": self.contact_force_state,
+            "engagement_state": self.engagement_state,
+            "keypoint_dist": self.keypoint_dist.unsqueeze(-1),
+            "fingertip_dir": F.normalize(
+                self.fingertip_midpoint_pos - noisy_fixed_pos, dim=-1, eps=1e-8),
+            "fingertip_dir_xy": F.normalize(
+                (self.fingertip_midpoint_pos - noisy_fixed_pos)[:, :2], dim=-1, eps=1e-8),
             "prev_actions": prev_actions,
         }
 
@@ -582,7 +591,7 @@ class FactoryEnv(DirectRLEnv):
         else:
             enc_out = self._compute_encoder_features()
             if enc_out is not None:
-                z, task_pred = enc_out
+                z_vis, z_force = enc_out
                 proprio_20 = torch.cat([
                     self.joint_pos[:, 0:7],
                     self.fingertip_midpoint_pos,
@@ -590,8 +599,8 @@ class FactoryEnv(DirectRLEnv):
                     self.ee_linvel_fd,
                     self.ee_angvel_fd,
                 ], dim=-1)
-                # Policy = [bottleneck(256D), proprio(20D), prev_a(6D)]
-                policy_obs = torch.cat([z, proprio_20, prev_actions], dim=-1)
+                # Policy = [z_vis(128), z_force(128), proprio(20), prev_a(6)] = 282D
+                policy_obs = torch.cat([z_vis, z_force, proprio_20, prev_actions], dim=-1)
                 critic_obs = torch.cat(
                     [state_dict[name] for name in self.cfg.state_order + ["prev_actions"]], dim=-1)
                 observations = {"policy": policy_obs, "critic": critic_obs}
@@ -884,9 +893,11 @@ class FactoryEnv(DirectRLEnv):
 
         self._set_assets_to_default_pose(env_ids)
         self._set_franka_to_default_pose(joints=self.cfg.ctrl.reset_joints, env_ids=env_ids)
+        # Material replacement BEFORE physics step (avoids setGlobalPose GPU error)
+        self._randomize_materials(self.cfg.domain_rand, env_ids)
         self.step_sim_no_action()
 
-        # Per-episode domain randomization (lighting, physics, visual)
+        # Per-episode domain randomization (lighting, physics)
         self._apply_domain_randomization(env_ids)
 
         self.randomize_initial_state(env_ids)
@@ -1128,15 +1139,73 @@ class FactoryEnv(DirectRLEnv):
             except Exception:
                 pass
 
-        # ── Visual: material randomization (USD shader properties) ──
-        self._randomize_materials(dr, env_ids)
+
+
+
+    # ── Material presets for full replacement ──
+    MATERIAL_PRESETS = [
+        # (diffuse RGB, roughness, metallic, opacity)
+        # Matte plastics — saturated
+        ((0.90, 0.05, 0.05), 0.5, 0.0, 1.0),   # 0: bright red
+        ((0.05, 0.15, 0.90), 0.4, 0.0, 1.0),   # 1: deep blue
+        ((0.05, 0.80, 0.10), 0.5, 0.0, 1.0),   # 2: vivid green
+        ((0.95, 0.90, 0.05), 0.3, 0.0, 1.0),   # 3: bright yellow
+        ((0.810, 0.17, 0.07), 0.4, 0.5, 1.0),   # 4: coral #e8734a
+        ((0.70, 0.05, 0.60), 0.4, 0.0, 1.0),   # 5: magenta
+        ((0.05, 0.70, 0.70), 0.4, 0.0, 1.0),   # 6: cyan
+        ((0.98, 0.98, 0.98), 0.3, 0.0, 1.0),   # 7: white matte
+        ((0.05, 0.05, 0.08), 0.6, 0.0, 1.0),   # 8: near-black matte
+        # Metals
+        ((0.90, 0.90, 0.92), 0.1, 0.9, 1.0),   # 9: polished steel
+        ((0.85, 0.60, 0.20), 0.2, 0.7, 1.0),   # 10: brass/gold
+        ((0.55, 0.35, 0.20), 0.3, 0.5, 1.0),   # 11: bronze
+        ((0.20, 0.20, 0.25), 0.5, 0.9, 1.0),   # 12: dark gunmetal
+        # Rubber/soft
+        ((0.25, 0.22, 0.22), 0.85, 0.05, 1.0), # 13: dark brown rubber
+        ((0.40, 0.40, 0.38), 0.75, 0.1, 1.0),  # 14: grey rubber
+        ((0.08, 0.35, 0.08), 0.7, 0.05, 1.0),  # 15: dark green rubber
+        # Extremes for table
+        ((0.98, 0.96, 0.88), 0.2, 0.0, 1.0),   # 16: cream/off-white
+        ((0.40, 0.25, 0.10), 0.6, 0.0, 1.0),   # 17: brown wood
+        ((0.55, 0.50, 0.55), 0.3, 0.4, 1.0),   # 18: slate grey metallic
+        ((0.82, 0.75, 0.65), 0.5, 0.0, 1.0),   # 19: light wood/beige
+        # High-contrast neon
+        ((0.10, 0.95, 0.20), 0.2, 0.0, 1.0),   # 20: neon green
+        ((1.00, 0.10, 0.60), 0.3, 0.0, 1.0),   # 21: hot pink
+        ((0.15, 0.80, 0.95), 0.2, 0.0, 1.0),   # 22: sky blue
+    ]
+
+    def _replace_material(self, prim, preset_idx: int):
+        """Create new material/shaders and bind to all descendant prims."""
+        try:
+            from pxr import UsdShade, Sdf, Gf
+            stage = prim.GetStage()
+            color, roughness, metallic, opacity = self.MATERIAL_PRESETS[preset_idx]
+
+            mat_path = prim.GetPath().AppendChild(f"material_preset_{preset_idx}")
+            mat = UsdShade.Material.Define(stage, mat_path)
+            shader = UsdShade.Shader.Define(stage, mat_path.AppendChild("shader"))
+            shader.CreateIdAttr("UsdPreviewSurface")
+            shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
+                Gf.Vec3f(*color))
+            shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(float(roughness))
+            shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(float(metallic))
+            shader.CreateInput("opacity", Sdf.ValueTypeNames.Float).Set(float(opacity))
+            mat.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
+
+            def _bind_all(p):
+                try:
+                    UsdShade.MaterialBindingAPI(p).Bind(mat)
+                except Exception:
+                    pass
+                for child in p.GetAllChildren():
+                    _bind_all(child)
+            _bind_all(prim)
+        except Exception:
+            pass
 
     def _randomize_materials(self, dr, env_ids):
-        """Randomize material appearance: color, roughness, metallic on USD prims.
-
-        Walks the stage under held/fixed asset and table prims, finds
-        UsdPreviewSurface shaders, and randomises their inputs.
-        """
+        """Randomize material appearance: param tweaks OR full preset replacement."""
         def _rand(lo: float, hi: float) -> float:
             return float(lo + (hi - lo) * torch.rand(1).item())
 
@@ -1148,6 +1217,19 @@ class FactoryEnv(DirectRLEnv):
                 return
         except Exception:
             return
+
+        # ── Hole material: preset 4 (neon orange) ──
+        if getattr(dr, "material_full_replace", False):
+            try:
+                fixed_prim = stage.GetPrimAtPath(
+                    self._fixed_asset.cfg.prim_path.replace("/World/envs/env_.*/", "/World/envs/env_0/"))
+                if fixed_prim and fixed_prim.IsValid():
+                    self._replace_material(fixed_prim, 4)
+            except Exception:
+                pass
+            return
+
+
 
         def _hsv_shift(rgb_in: tuple, hue_delta: float, sat_mul: float, val_mul: float) -> tuple:
             """Shift hue (0-360°), multiply saturation and value."""
@@ -1467,7 +1549,7 @@ class FactoryEnv(DirectRLEnv):
         self.prev_actions = torch.zeros_like(self.actions)
         # Reset encoder visual cache (Δv = v_t - prev_v_t needs clean start)
         if self._encoder is not None:
-            self._encoder.reset(env_ids)
+            self._encoder.reset_cache(env_ids)
         # Back out what actions should be for initial state.
         # Relative position to bolt tip.
         self.fixed_pos_action_frame[:] = self.fixed_pos_obs_frame + self.init_fixed_pos_obs_noise

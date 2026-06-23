@@ -22,6 +22,8 @@ OBS_DIM_CFG = {
     "fingertip_quat": 4,
     "ee_linvel": 3,
     "ee_angvel": 3,
+    "engagement_state": 1,
+    "fingertip_dir_xy": 2,
 }
 
 STATE_DIM_CFG = {
@@ -82,10 +84,10 @@ class DomainRandCfg:
     # ── Visual: lighting ──
     dome_light_intensity: list = [0.7, 1.3]       # multiplier on default intensity
     key_light_intensity: list = [0.8, 1.2]
-    light_color_temp: list = [0.9, 1.1]            # multiplier on RGB (warm ↔ cool)
+
 
     # ── Visual: camera ──
-    camera_pos_noise: list = [0.002, 0.002, 0.002]  # metres, added to eye_local per episode
+    camera_pos_noise: list = [0.00, 0.00, 0.00]  # metres, added to eye_local per episode
     camera_target_noise: list = [0.005, 0.005, 0.005]
 
     # ── Physics: mass ──
@@ -101,8 +103,8 @@ class DomainRandCfg:
     joint_stiffness_scale: list = [0.9, 1.1]       # multiplier on default kp
 
     # ── Physics: peg/hole clearance ──
-    peg_scale: list = [0.98, 1.02]                 # uniform scale on peg mesh
-    hole_scale: list = [0.99, 1.01]                # uniform scale on hole fixture
+    peg_scale: list = [0.98, 1.00]                 # uniform scale on peg mesh
+    hole_scale: list = [1.00, 1.02]                # uniform scale on hole fixture
 
     # ── Visual: material appearance ──
     peg_hue_shift: list = [0.0, 0.0]               # hue rotation in degrees (0-360)
@@ -114,6 +116,9 @@ class DomainRandCfg:
     floor_hue_shift: list = [0.0, 0.0]             # floor hue rotation
     fixture_hue_shift: list = [0.0, 0.0]           # hole fixture hue rotation
 
+    # ── Full material replacement ──
+    material_full_replace: bool = True          # If True: completely swap materials per-episode
+
 
 @configclass
 class CtrlCfg:
@@ -122,7 +127,7 @@ class CtrlCfg:
     pos_action_bounds = [0.05, 0.05, 0.05]
     rot_action_bounds = [1.0, 1.0, 1.0]
 
-    pos_action_threshold = [0.02, 0.02, 0.02]
+    pos_action_threshold = [0.005, 0.005, 0.005]
     rot_action_threshold = [0.097, 0.097, 0.097]
 
     reset_joints = [1.5178e-03, -1.9651e-01, -1.4364e-03, -1.9761, -2.7717e-04, 1.7796, 7.8556e-01]
@@ -155,7 +160,7 @@ class FactoryEnvCfg(DirectRLEnvCfg):
     # num_*: will be overwritten to correspond to obs_order, state_order.
     observation_space = 21
     state_space = 72
-    obs_order: list = ["fingertip_pos_rel_fixed", "fingertip_quat", "ee_linvel", "ee_angvel"]
+    obs_order: list = ["fingertip_dir_xy", "engagement_state", "fingertip_quat", "ee_linvel", "ee_angvel"]  # SANITY: 19D, XY dir+eng
     state_order: list = [
         "fingertip_pos",
         "fingertip_quat",
@@ -183,7 +188,7 @@ class FactoryEnvCfg(DirectRLEnvCfg):
 
     # Encoder checkpoint (Stage F). When set, policy obs = [bottleneck(256D), proprio(20D)].
     encoder_checkpoint: str = ""
-    encoder_backbone: str = "resnet18"
+    encoder_backbone: str = ""
 
     episode_length_s = 10.0  # Probably need to override.
     sim: SimulationCfg = SimulationCfg(
@@ -386,30 +391,13 @@ class FactoryTaskPegInsertEncoderCfg(FactoryTaskPegInsertVisionCfg):
     """
 
     encoder_checkpoint: str = "/workspace/isaaclab/output/pretrain/pretrained_encoder_best.pt"
-    encoder_backbone: str = "dinov2_vits14"
+    encoder_backbone: str = "dinov2_vits14_attn"
     encoder_debug_state_policy: bool = False
     encoder_ablate_bottleneck: bool = False
-    """If True: no encoder, no cameras. held_pos_rel_fixed(3D) from privileged state.
-    Policy = [held_pos_rel_fixed(3), proprio(20), prev_a(6)] = 29D.
-    Ablation: is the bottleneck providing more spatial info than a 3D delta vector?"""
-    curriculum_pos_alpha_delay_steps: float = 655360   # 80 iters pure GT
-    curriculum_pos_alpha_decay_steps: float = 40960   # 10 iters linear decay
-    curriculum_pos_alpha_success_threshold: float = 0.90  # only decay when success EMA > this
-    encoder_feed_task_pred: bool = False
-    """If True: policy obs includes head_task output (3D). 285D.
-    If False: policy obs = [z(256), proprio(20), prev_a(6)] = 282D (no task_pred)."""
-
-
-@configclass
-@configclass
-class FactoryTaskPegInsertEncoderV7Cfg(FactoryTaskPegInsertVisionCfg):
-    """V7 token-level fusion encoder for RL."""
-    encoder_checkpoint: str = "/workspace/isaaclab/output/pretrain/pretrained_encoder_best.pt"
-    encoder_backbone: str = "dinov2_vits14"
-    encoder_debug_state_policy: bool = False
-    encoder_ablate_bottleneck: bool = False
-    encoder_v7: bool = True
-    # V7 policy obs: z_vis(128)+z_task(64)+z_force(32)+z_gate(8)+proprio(20)+prev_a(6) = 258D
+    curriculum_pos_alpha_delay_steps: float = 655360
+    curriculum_pos_alpha_decay_steps: float = 40960
+    curriculum_pos_alpha_success_threshold: float = 0.90
+    encoder_feed_task_pred: bool = True
 
 
 @configclass
@@ -457,13 +445,13 @@ class FactoryTaskGearMeshEncoderCfg(FactoryTaskGearMeshCfg):
 
     # ── Encoder config ──
     encoder_checkpoint: str = "/workspace/isaaclab/output/pretrain/pretrained_encoder_best.pt"
-    encoder_backbone: str = "dinov2_vits14"
+    encoder_backbone: str = "dinov2_vits14_attn"
     encoder_debug_state_policy: bool = False
     encoder_ablate_bottleneck: bool = False
     curriculum_pos_alpha_delay_steps: float = 655360
     curriculum_pos_alpha_decay_steps: float = 163840
     curriculum_pos_alpha_success_threshold: float = 0.90
-    encoder_feed_task_pred: bool = True
+    encoder_feed_task_pred: bool = False
 
 
 @configclass
@@ -474,7 +462,7 @@ class FactoryTaskPegInsertMonoEncoderCfg(FactoryTaskPegInsertEncoderCfg):
     """
 
     tiled_camera_right: TiledCameraCfg | None = None
-    encoder_mono: bool = True
+    encoder_mono: bool = False
 
 
 @configclass

@@ -34,12 +34,17 @@ import gymnasium as gym
 import isaaclab_tasks  # noqa: F401
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from rl_games.common import env_configurations, vecenv
 from rl_games.common.algo_observer import IsaacAlgoObserver
 from rl_games.torch_runner import Runner
 from isaaclab_rl.rl_games import RlGamesVecEnvWrapper
 from isaaclab_tasks.utils.parse_cfg import parse_env_cfg
+
+
+
+
 N = cfg_yaml["num_envs"]
 
 # ── Create env ──
@@ -227,6 +232,10 @@ def collect_split(sc):
                 "held_pos": env_.held_pos[i].tolist(),
                 "fixed_pos": env_.fixed_pos[i].tolist(),
                 "held_pos_rel_fixed": (env_.held_pos[i] - env_.fixed_pos_obs_frame[i]).tolist(),
+                "fingertip_pos_rel_fixed": (env_.fingertip_midpoint_pos[i] - env_.fixed_pos_obs_frame[i]).tolist(),
+                "fingertip_dir_xy": F.normalize(
+                    (env_.fingertip_midpoint_pos[i] - env_.fixed_pos_obs_frame[i])[:2],
+                    dim=-1, eps=1e-8).tolist(),
                 "action": actions[i].tolist(),
                 "is_terminal": bool(terms[i] or truncs[i]),
                 "reward": float(rews[i].item()),

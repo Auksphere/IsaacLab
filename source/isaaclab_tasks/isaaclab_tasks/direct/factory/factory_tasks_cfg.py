@@ -123,43 +123,11 @@ class PegInsert(FactoryTask):
     held_asset_pos_noise: list = [0.003, 0.0, 0.003]  # noise level of the held asset in gripper
     held_asset_rot_init: float = 0.0
 
-    # Rewards
-    keypoint_coef_baseline: list = [5, 4]
-    keypoint_coef_coarse: list = [50, 2]
-    keypoint_coef_fine: list = [100, 0]
-    # Fraction of socket height.
-    success_threshold: float = 0.04
-    engage_threshold: float = 0.9
-
-    fixed_asset: ArticulationCfg = ArticulationCfg(
-        prim_path="/World/envs/env_.*/FixedAsset",
-        spawn=sim_utils.UsdFileCfg(
-            usd_path=fixed_asset_cfg.usd_path,
-            activate_contact_sensors=True,
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                disable_gravity=False,
-                max_depenetration_velocity=5.0,
-                linear_damping=0.0,
-                angular_damping=0.0,
-                max_linear_velocity=1000.0,
-                max_angular_velocity=3666.0,
-                enable_gyroscopic_forces=True,
-                solver_position_iteration_count=192,
-                solver_velocity_iteration_count=1,
-                max_contact_impulse=1e32,
-            ),
-            mass_props=sim_utils.MassPropertiesCfg(mass=fixed_asset_cfg.mass),
-            collision_props=sim_utils.CollisionPropertiesCfg(contact_offset=0.005, rest_offset=0.0),
-        ),
-        init_state=ArticulationCfg.InitialStateCfg(
-            pos=(0.6, 0.0, 0.05), rot=(1.0, 0.0, 0.0, 0.0), joint_pos={}, joint_vel={}
-        ),
-        actuators={},
-    )
     held_asset: ArticulationCfg = ArticulationCfg(
         prim_path="/World/envs/env_.*/HeldAsset",
         spawn=sim_utils.UsdFileCfg(
             usd_path=held_asset_cfg.usd_path,
+            scale=(2.0, 2.0, 1.2),  # 8mm → 16mm
             activate_contact_sensors=True,
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 disable_gravity=True,
@@ -181,6 +149,42 @@ class PegInsert(FactoryTask):
         ),
         actuators={},
     )
+
+    # Rewards
+    keypoint_coef_baseline: list = [5, 4]
+    keypoint_coef_coarse: list = [50, 2]
+    keypoint_coef_fine: list = [100, 0]
+    # Fraction of socket height.
+    success_threshold: float = 0.04
+    engage_threshold: float = 0.9
+
+    fixed_asset: ArticulationCfg = ArticulationCfg(
+        prim_path="/World/envs/env_.*/FixedAsset",
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=fixed_asset_cfg.usd_path,
+            scale=(2.2, 2.2, 1.2),  # 8mm → 16mm
+            activate_contact_sensors=True,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                disable_gravity=False,
+                max_depenetration_velocity=5.0,
+                linear_damping=0.0,
+                angular_damping=0.0,
+                max_linear_velocity=1000.0,
+                max_angular_velocity=3666.0,
+                enable_gyroscopic_forces=True,
+                solver_position_iteration_count=192,
+                solver_velocity_iteration_count=1,
+                max_contact_impulse=1e32,
+            ),
+            mass_props=sim_utils.MassPropertiesCfg(mass=fixed_asset_cfg.mass),
+            collision_props=sim_utils.CollisionPropertiesCfg(contact_offset=0.005, rest_offset=0.0),
+        ),
+        init_state=ArticulationCfg.InitialStateCfg(
+            pos=(0.6, 0.0, 0.05), rot=(1.0, 0.0, 0.0, 0.0), joint_pos={}, joint_vel={}
+        ),
+        actuators={},
+    )
+
 
 
 # ── USB-A Insertion ──────────────────────────────────────────────────────────────

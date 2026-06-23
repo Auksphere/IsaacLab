@@ -29,15 +29,15 @@ action_noise: 1.20      # Gaussian noise σ on expert actions (0 = pure expert)
 # Each split collects <episodes> episodes with its own seed and DR preset.
 splits:
   - name: train
-    episodes: 240
+    episodes: 300
     seed: 42
     domain_rand: strong
   - name: val
-    episodes: 30
+    episodes: 60
     seed: 123
     domain_rand: mild
   - name: test
-    episodes: 30
+    episodes: 60
     seed: 456
     domain_rand: none
 
@@ -48,10 +48,10 @@ domain_randomization:
   none: {}
 
   mild:
-    dome_light_intensity: [0.5, 1.5]
+    dome_light_intensity: [0.8, 1.2]
     camera_pos_noise: [0.00, 0.00, 0.00]
     held_mass_scale: [0.95, 1.05]
-    held_friction: [0.9, 1.1]
+    held_friction: [0.8, 1.2]
 
   strong:
     # lighting
@@ -70,7 +70,7 @@ domain_randomization:
     peg_saturation: [0.5, 1.5]
     peg_value: [0.5, 1.5]
     table_roughness: [0.2, 0.9]
-    table_metallic: [0.0, 0.4]
-    table_color_shift: [0.5, 0.5, 0.5]
+    table_metallic: [0.0, 0.9]
+    table_color_shift: [0.9, 0.9, 0.9]
     floor_hue_shift: [0, 360]
     fixture_hue_shift: [0, 360]

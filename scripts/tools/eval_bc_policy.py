@@ -22,7 +22,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--encoder-ckpt", type=str, required=True)
 parser.add_argument("--bc-ckpt", type=str, default="")   # robomimic checkpoint
 parser.add_argument("--bc-mlp", type=str, default="")     # simple BC MLP checkpoint
-parser.add_argument("--backbone", type=str, default="dinov2_vits14")
+parser.add_argument("--backbone", type=str, default="dinov2_vits14_attn")
 parser.add_argument("--episodes", type=int, default=20)
 parser.add_argument("--max-steps", type=int, default=200)
 AppLauncher.add_app_launcher_args(parser)
@@ -112,8 +112,8 @@ def main():
             # ── Encode observation ──
             img_l = preprocess_rgb(env_._tiled_camera_left.data.output["rgb"])
             img_r = preprocess_rgb(env_._tiled_camera_right.data.output["rgb"])
-            ft_3f = env_.ft_ring[:, -3:, :].reshape(N, 18)
-            ft_3f_k = env_.ft_ring[:, :3, :].reshape(N, 18)
+            ft_3f = env_.ft_ring[:, -10:, :].reshape(N, 60)     # 10-frame window
+            ft_3f_k = env_.ft_ring[:, :10, :].reshape(N, 60)   # K steps ago
             proprio_20 = torch.cat([
                 env_.joint_pos[:, 0:7], env_.fingertip_midpoint_pos,
                 env_.fingertip_midpoint_quat, env_.ee_linvel_fd, env_.ee_angvel_fd,
@@ -121,12 +121,13 @@ def main():
 
             with torch.no_grad():
                 with torch.cuda.amp.autocast(enabled=True, dtype=torch.float16):
-                    z, task_pred = encoder.forward_features(
+                    z_vis, z_force, task_norm, _ = encoder.forward_features(
                         img_l, img_r, ft_3f, ft_3f_k, prev_action, proprio_20)
 
-            # Build 285D obs
+            # Build 285D obs: z_vis(128) + z_force(128) + task_pred(3) + proprio(20) + prev_a(6)
             obs_285 = torch.cat([
-                z.float(), task_pred.float(), proprio_20.float(), prev_action.float()
+                z_vis.float(), z_force.float(), task_norm.float(),
+                proprio_20.float(), prev_action.float()
             ], dim=-1)  # (1, 285)
 
             # ── BC policy inference ──

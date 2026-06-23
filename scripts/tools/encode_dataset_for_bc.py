@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Encode demo dataset using frozen encoder → robomimic HDF5 format.
+"""Encode demo dataset using frozen encoder → HDF5 format for BC/LfD.
 
-Reads JSONL+PNG dataset, runs encoder to produce 285D observations,
-writes robomimic-compatible HDF5 files for BC training.
+Reads JSONL+PNG dataset, runs encoder to produce 282D observations,
+writes HDF5 files compatible with DemoBuffer for PPO demo mixing.
 
 Usage (host machine, no Isaac Sim):
   python encode_dataset_for_bc.py \
-    --encoder-ckpt /path/to/pretrained_encoder_best.pt \
-    --data-dir ../../data --output ../data/bc_dataset.hdf5
+    --encoder-ckpt ../../output/pretrain/pretrained_encoder_best.pt \
+    --data-dir ../../data --output ../../output/bc_train.hdf5
 """
 
 import argparse, json, os, sys
@@ -26,7 +26,7 @@ sys.path.insert(0, str(THIS_DIR.parent.parent / "source" / "isaaclab_tasks"
                        / "isaaclab_tasks" / "direct" / "factory"))
 from encoder import VisualForceEncoder, preprocess_rgb, IMG_SIZE
 
-FT_FRAMES = 3
+FT_FRAMES = 10
 FT_DIM = 6
 K = 3
 
@@ -48,9 +48,10 @@ def load_jsonl(jsonl_path):
 
 
 def build_obs_for_frame(ep, idx, prev_action_6d, encoder, device):
-    """Build 285D observation for a single frame.
+    """Build 282D observation for a single frame.
 
-    Returns: obs_285 (np.ndarray of shape (285,))
+    Returns: obs_282 (np.ndarray of shape (282,))
+    obs = z(256) + proprio(20) + prev_a(6) — matches RL policy input
     """
     # Image: load from disk, preprocess
     img_dir = Path(args.data_dir) / args.split / "images"
@@ -61,31 +62,29 @@ def build_obs_for_frame(ep, idx, prev_action_6d, encoder, device):
     img_r = np.array(Image.open(str(r_path)).convert("RGB"), dtype=np.float32)
     img_l = torch.from_numpy(img_l / 255.0).permute(2, 0, 1).unsqueeze(0).to(device)
     img_r = torch.from_numpy(img_r / 255.0).permute(2, 0, 1).unsqueeze(0).to(device)
-    # Resize if needed
     if img_l.shape[-2] != IMG_SIZE:
         img_l = F.interpolate(img_l, size=(IMG_SIZE, IMG_SIZE), mode='bilinear', align_corners=False)
         img_r = F.interpolate(img_r, size=(IMG_SIZE, IMG_SIZE), mode='bilinear', align_corners=False)
-    # ImageNet normalize
     IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
     IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
     img_l = (img_l - IMAGENET_MEAN) / IMAGENET_STD
     img_r = (img_r - IMAGENET_MEAN) / IMAGENET_STD
 
-    # Force: 3-frame window ending at idx
+    # Force: 10-frame window ending at idx
     def get_ft(i):
         ft = ep[max(0, min(i, len(ep) - 1))].get("force_torque", [0.0] * FT_DIM)
         return [float(v) for v in ft[:FT_DIM]]
 
     ft_3f = []
-    for offset in range(-2, 1):
+    for offset in range(-(FT_FRAMES - 1), 1):
         ft_3f.extend(get_ft(idx + offset))
-    ft_3f = torch.tensor(ft_3f, dtype=torch.float32, device=device).unsqueeze(0)  # (1, 18)
+    ft_3f = torch.tensor(ft_3f, dtype=torch.float32, device=device).unsqueeze(0)  # (1, 60)
 
     idx_k = idx - K
     ft_3f_k = []
-    for offset in range(-2, 1):
+    for offset in range(-(FT_FRAMES - 1), 1):
         ft_3f_k.extend(get_ft(max(0, idx_k + offset)))
-    ft_3f_k = torch.tensor(ft_3f_k, dtype=torch.float32, device=device).unsqueeze(0)  # (1, 18)
+    ft_3f_k = torch.tensor(ft_3f_k, dtype=torch.float32, device=device).unsqueeze(0)  # (1, 60)
 
     # Proprio
     rec = ep[idx]
@@ -97,20 +96,19 @@ def build_obs_for_frame(ep, idx, prev_action_6d, encoder, device):
     proprio_20 = joint_pos + fingertip_pos + fingertip_quat + ee_linvel + ee_angvel
     proprio_20 = torch.tensor(proprio_20, dtype=torch.float32, device=device).unsqueeze(0)
 
-    # Encode → V7: 4 Z vectors
+    # Encode → z_vis(128) + z_force(128) = 256D features, + task_norm(3)
     with torch.no_grad():
         with torch.cuda.amp.autocast(enabled=True, dtype=torch.float16):
-            z_vis, z_force, z_gate, z_task = encoder.forward_features(img_l, ft_3f)
+            z_vis, z_force, _, _ = encoder.forward_features(
+                img_l, img_r, ft_3f, ft_3f_k,
+                prev_action_6d.unsqueeze(0), proprio_20)
 
-    z_vis   = z_vis.float().cpu().squeeze(0)
-    z_force = z_force.float().cpu().squeeze(0)
-    z_gate  = z_gate.float().cpu().squeeze(0)
-    z_task  = z_task.float().cpu().squeeze(0)
-    proprio = proprio_20.float().cpu().squeeze(0)
-    prev_a  = prev_action_6d.float().cpu()
+    z = torch.cat([z_vis, z_force], dim=-1).float().cpu().squeeze(0)  # (256,)
+    proprio = proprio_20.float().cpu().squeeze(0)   # (20,)
+    prev_a = prev_action_6d.float().cpu()           # (6,)
 
-    # RL policy obs: [z_vis(128), z_task(64), z_force(32), z_gate(8), proprio(20), prev_a(6)] = 258D
-    obs = torch.cat([z_vis, z_task, z_force, z_gate, proprio, prev_a], dim=-1)
+    # RL policy obs: z(256) + proprio(20) + prev_a(6) = 282D
+    obs = torch.cat([z, proprio, prev_a], dim=-1)
     return obs.numpy()
 
 
@@ -118,7 +116,7 @@ def main():
     global args
     parser = argparse.ArgumentParser()
     parser.add_argument("--encoder-ckpt", type=str, required=True)
-    parser.add_argument("--backbone", type=str, default="dinov2_vits14")
+    parser.add_argument("--backbone", type=str, default="dinov2_vits14_attn")
     parser.add_argument("--data-dir", type=str, default=str(THIS_DIR.parent.parent / "data"))
     parser.add_argument("--output", type=str, default="")
     parser.add_argument("--device", type=str, default="cuda")
@@ -212,7 +210,7 @@ def main():
     hf.close()
 
     print(f"\nDone: {demo_idx} episodes, {total_frames} frames → {output_path}")
-    print(f"Observation dim: 258 = z_vis(128)+z_task(64)+z_force(32)+z_gate(8)+proprio(20)+prev_action(6)")
+    print(f"Observation dim: 282 = z(256)+proprio(20)+prev_a(6)")
 
 
 if __name__ == "__main__":

@@ -6,7 +6,6 @@
 # =============================================================================
 
 # ── Data ─────────────────────────────────────────────────────────────────────
-# Host-side path to the dataset produced by collect_unified_dataset.py.
 data_dir: /home/hanyu/wangyuhan/HIROLRobotPlatform/dependencies/isaaclab/data
 
 # ── Training ─────────────────────────────────────────────────────────────────
@@ -19,43 +18,27 @@ seed: 42
 device: cuda
 
 # ── Loss weights ─────────────────────────────────────────────────────────────
-w_dynamics: 5.0
-w_vicreg: 10.0
-w_task: 30.0         # task prediction (held_pos_rel_fixed 3D)
-w_fut: 5.0           # future self-prediction (cosine distance)
+w_dyn: 1.0
+w_task: 15.0
+w_eng: 10.0
+w_recon: 1.0       # masked latent reconstruction (MAE-style)
+
 # ── Warmup ───────────────────────────────────────────────────────────────────
-warmup_inv_cons: 5       # enable inverse-consistency loss after this epoch
-warmup_vicreg: 5         # enable VICReg after this epoch
-warmup_force_noise: 10   # enable force perturbation after this epoch
+warmup_inv_cons: 5
 
 # ── Force noise ──────────────────────────────────────────────────────────────
-# Values in raw Newtons (ForceMLP LayerNorm handles scaling).
-# Contact dynamics ~5-20N; σ=1N is mild perturbation, ~5-20% of signal.
-sigma_start: 0.0         # initial σ (N) at warmup start
-sigma_end: 2.0           # final σ (N)
-sigma_start_epoch: 10    # epoch to begin noise anneal
-sigma_end_epoch: 80      # epoch to reach sigma_end
+# sigma_start: 0.0
+# sigma_end: 2.0
+# sigma_start_epoch: 10
+# sigma_end_epoch: 80
 
 # ── Model ────────────────────────────────────────────────────────────────────
-# Backbone choices:
-#   resnet18       — ResNet-18  (512D,  ~12M frozen params)
-#   resnet50       — ResNet-50  (2048D, ~25M frozen params)
-#   dinov2_vits14  — DINOv2 ViT-S/14 (384D, ~22M frozen params)
-#   dinov2_vitb14  — DINOv2 ViT-B/14 (768D, ~86M frozen params)
-backbone: dinov2_vits14
-pretrained_backbone: true   # load pretrained weights (recommended)
-freeze_backbone: true       # freeze backbone during pretraining
-mono: false                  # true = monocular camera (no fusion_mlp)
+# backbone: dinov2_vits14
+backbone: dinov2_vits14_attn
+pretrained_backbone: true
+freeze_backbone: true
+mono: false
 
 # ── Output ───────────────────────────────────────────────────────────────────
-output_dir: ../../output/pretrain   # relative to this script → isaaclab/output/pretrain/
-early_stop_patience: 15          # stop if val_fwd doesn't improve for N epochs
-
-# ── Ablation flags ───────────────────────────────────────────────────────────
-# Used for the 6-row core ablation (see idea.md §6).
-# Set individual flags to false to disable components.
-ablation:
-  use_visual_dynamics: true    # Δv → Δp_base
-  use_force_dynamics: true     # Δf → Δp_resid + gating
-  use_inverse_consistency: true # bwd pass + L_cons
-  use_vicreg: true             # bottleneck regularisation
+output_dir: ../../output/pretrain
+early_stop_patience: 15
