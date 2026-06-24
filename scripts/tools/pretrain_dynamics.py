@@ -437,8 +437,8 @@ class SymmetricDynamicsEncoder(nn.Module):
 # =============================================================================
 
 def sim2real_visual_augment(imgs: torch.Tensor) -> torch.Tensor:
-    """Per-image visual augmentation: brightness, contrast, saturation, blur, noise.
-    imgs: (N, 3, H, W) normalized by ImageNet stats. Returns same shape."""
+    """Per-image visual augmentation: brightness, contrast, saturation, blur, noise,
+    plus random translation to simulate camera-target noise (±5mm → ±5px)."""
     import torchvision.transforms.functional as VF
     mean_t = torch.tensor(IMAGENET_MEAN, device=imgs.device).view(1, 3, 1, 1)
     std_t  = torch.tensor(IMAGENET_STD,  device=imgs.device).view(1, 3, 1, 1)
@@ -447,6 +447,11 @@ def sim2real_visual_augment(imgs: torch.Tensor) -> torch.Tensor:
     N = x.shape[0]
     for i in range(N):
         xi = x[i]
+        # Random translation (simulates camera-target noise ±5px)
+        dx = float(torch.randint(-5, 6, (1,)).item())
+        dy = float(torch.randint(-5, 6, (1,)).item())
+        if dx != 0 or dy != 0:
+            xi = VF.affine(xi, angle=0.0, translate=[dx, dy], scale=1.0, shear=0.0)
         xi = VF.adjust_brightness(xi, float(0.75 + 0.50 * torch.rand(1).item()))
         xi = VF.adjust_contrast(xi,   float(0.75 + 0.50 * torch.rand(1).item()))
         xi = VF.adjust_saturation(xi, float(0.60 + 0.80 * torch.rand(1).item()))

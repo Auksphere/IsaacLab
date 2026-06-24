@@ -58,7 +58,7 @@ params:
   config:
     name: Factory
     device: cuda:0
-    full_experiment_name: encoder_attn
+    full_experiment_name: encoder_attn1
     env_name: rlgpu
     # Ablation: set encoder_ablate_bottleneck=True in factory_env_cfg.FactoryTaskPegInsertEncoderCfg
     # to test whether bottleneck features are necessary (policy = 27D, no encoder).
@@ -84,10 +84,6 @@ params:
     save_best_after: 10
     save_frequency: 100
     print_stats: True
-    # LfD demo mixing: inject expert trajectories into PPO buffer
-    demo_data_path: "/workspace/isaaclab/output/bc_train.hdf5"
-    demo_mix_ratio: 0.00
-    demo_trajectories_per_iter: 32
     grad_norm: 1.0
     entropy_coef: 0.00
     truncate_grads: True
