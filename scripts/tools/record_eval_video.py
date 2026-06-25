@@ -8,15 +8,25 @@ side-by-side MP4 videos with task prediction, engagement, and keypoint
 distance overlays.
 
 Usage (inside container):
-  # With encoder:
+  # PegInsert (default):
   ./isaaclab.sh -p scripts/tools/record_eval_video.py \
     --ckpt /workspace/isaaclab/logs/rl_games/Factory/.../nn/last_Factory_*.pth \
     --encoder-ckpt /workspace/isaaclab/output/pretrain/pretrained_encoder_best.pt \
-    --episodes 5 --output-dir /workspace/isaaclab/output/videos --no-rand
+    --episodes 5 --output-dir /workspace/isaaclab/output/videos
+
+  # GearMesh:
+  ./isaaclab.sh -p scripts/tools/record_eval_video.py \
+    --task Isaac-Factory-GearMesh-Encoder-Direct-v0 \
+    --ckpt /workspace/isaaclab/logs/rl_games/Factory/.../nn/last_Factory.pth \
+    --encoder-ckpt /workspace/isaaclab/output/pretrain/pretrained_encoder_best.pt \
+    --episodes 5 --output-dir /workspace/isaaclab/output/videos
+
+  # Deterministic (no domain rand):
+    ...  --no-rand
 
   # Sanity check (no encoder, privileged-state policy):
   ./isaaclab.sh -p scripts/tools/record_eval_video.py \
-    --ckpt /workspace/isaaclab/logs/rl_games/Factory/.../nn/last_Factory_*.pth \
+    --ckpt /workspace/isaaclab/logs/rl_games/Factory/.../nn/Factory.pth \
     --episodes 5 --output-dir /workspace/isaaclab/output/videos
 """
 import argparse, math, os, sys, time
@@ -26,6 +36,10 @@ from pathlib import Path
 from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description="Record eval videos with dual cameras.")
+parser.add_argument("--task", type=str,
+                    default="Isaac-Factory-PegInsert-Encoder-Direct-v0",
+                    help="Task name (default: PegInsert encoder). "
+                    "Also: Isaac-Factory-GearMesh-Encoder-Direct-v0")
 parser.add_argument("--ckpt", type=str, required=True,
                     help="RL Games policy checkpoint (.pth).")
 parser.add_argument("--encoder-ckpt", type=str, default="",
@@ -34,8 +48,8 @@ parser.add_argument("--backbone", type=str, default=None,
                     help="Encoder backbone (default: use config class default).")
 parser.add_argument("--episodes", type=int, default=5,
                     help="Number of episodes to record (default: 5).")
-parser.add_argument("--max-steps", type=int, default=200,
-                    help="Max steps per episode (default: 200).")
+parser.add_argument("--max-steps", type=int, default=450,
+                    help="Max steps per episode (default: 450, ~30s at 15Hz).")
 parser.add_argument("--output-dir", type=str,
                     default="/workspace/isaaclab/output/videos",
                     help="Output directory for videos (default: /workspace/isaaclab/output/videos).")
@@ -78,7 +92,7 @@ device = "cuda:0"
 has_encoder = args_cli.encoder_ckpt and args_cli.encoder_ckpt != ""
 
 print(f"[INFO] Creating env (N={N}, encoder={'YES' if has_encoder else 'debug_state_policy'})...")
-cfg = parse_env_cfg("Isaac-Factory-PegInsert-Encoder-Direct-v0", device=device, num_envs=N)
+cfg = parse_env_cfg(args_cli.task, device=device, num_envs=N)
 
 if has_encoder:
     cfg.encoder_checkpoint = args_cli.encoder_ckpt
@@ -91,7 +105,7 @@ else:
     cfg.encoder_debug_keep_cameras = True
 
 cfg.seed = 42
-cfg.episode_length_s = 15.0  # eval only: more time for 16mm insertion
+cfg.episode_length_s = 30.0  # eval: generous timeout for GearMesh/PegInsert
 if args_cli.no_rand:
     # Disable all domain randomization
     dr = cfg.domain_rand
@@ -109,7 +123,7 @@ if args_cli.no_rand:
     dr.peg_scale = [1.0, 1.0]
     dr.hole_scale = [1.0, 1.0]
     print("[INFO] Domain randomization DISABLED")
-env = gym.make("Isaac-Factory-PegInsert-Encoder-Direct-v0", cfg=cfg)
+env = gym.make(args_cli.task, cfg=cfg)
 env_ = env.unwrapped  # direct access to FactoryEnv internals
 
 # ── Load encoder (if provided) ──
